@@ -206,8 +206,23 @@ def compare(
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def row_bg(row):
         return [f"background-color:{STATUS_META.get(row['Status'],{}).get('bg','#fff')}"] * len(row)
-    num_fmt = {c: "{:,.4g}" for c in df.columns
-               if pd.api.types.is_float_dtype(df[c]) or c == "Δ Change"}
+
+    # Coerce numeric cols explicitly before formatting
+    df = df.copy()
+    for c in df.columns:
+        if c not in ("Status", "Group") and not c.endswith("(File A)") is False:
+            try:
+                converted = pd.to_numeric(df[c], errors="coerce")
+                if converted.notna().sum() > 0:
+                    df[c] = converted
+            except Exception:
+                pass
+
+    num_fmt = {}
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            num_fmt[c] = "{:,.4g}"
+
     return (
         df.style
         .apply(row_bg, axis=1)
@@ -426,12 +441,11 @@ for grp_name, grp_df in view.groupby("Group", sort=True):
     results_by_group[grp_name] = grp_df.copy()
     gc = grp_df["Status"].value_counts()
     badges = "  ".join(
-        f'<span style="color:{STATUS_META[s]["color"]};font-weight:700">'
-        f'{STATUS_META[s]["icon"]} {s}: {gc.get(s,0)}</span>'
+        f"{STATUS_META[s]['icon']} {s}: {gc.get(s,0)}"
         for s in STATUS_ORDER if gc.get(s, 0) > 0
     )
     grp_label = "All Rows" if grp_name == "All" else f"{grp_col}: {grp_name}"
-    expander_label = f"{grp_label} — {len(grp_df):,} rows   {badges}"
+    expander_label = f"{grp_label} — {len(grp_df):,} rows  |  {badges}"
     with st.expander(expander_label, expanded=(grp_name == "All" or view["Group"].nunique() == 1)):
         show = grp_df.drop(columns=["Group"], errors="ignore")
         st.dataframe(
