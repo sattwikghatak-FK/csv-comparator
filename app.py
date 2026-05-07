@@ -31,14 +31,9 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
     """Clear everything when core inputs change."""
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "csv_data"]:
+    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is"]:
         if key in st.session_state:
             del st.session_state[key]
-
-def reset_exports():
-    """Clear generated CSV when UI filters are changed."""
-    if "csv_data" in st.session_state:
-        del st.session_state["csv_data"]
 
 # ── Data Processing Helpers ───────────────────────────────────────────────────
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -77,24 +72,25 @@ def match_columns(cols_a: list, cols_b: list) -> dict:
             mapping[ca] = nb
     return mapping   
 
-@st.cache_data(show_spinner=False)
-def get_sheet_names(file_bytes: bytes) -> list:
-    xls = pd.ExcelFile(BytesIO(file_bytes))
+def get_sheet_names(file) -> list:
+    file.seek(0)
+    xls = pd.ExcelFile(file)
     return xls.sheet_names
 
-@st.cache_data(show_spinner=False)
-def get_preview_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    file.seek(0)
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
+        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
     else:
-        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
+        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
     return clean_df(df)
 
-def load_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def load_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    file.seek(0)
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False)
+        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
     else:
-        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
+        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
 
 def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
@@ -260,19 +256,19 @@ with st.container(border=True):
     with c1:
         st.markdown("**📁 File A — Baseline / Previous**")
         up_a = st.file_uploader("File A", type=["csv", "xlsx"], key="fa", label_visibility="collapsed", on_change=reset_computation)
-        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a.getvalue()), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
+        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
     with c2:
         st.markdown("**📁 File B — Current / New**")
         up_b = st.file_uploader("File B", type=["csv", "xlsx"], key="fb", label_visibility="collapsed", on_change=reset_computation)
-        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b.getvalue()), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
+        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
 
 if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
 with st.spinner("Extracting headers and detecting data types..."):
-    df_a_preview = get_preview_data(up_a.getvalue(), up_a.name, sheet_a)
-    df_b_preview = get_preview_data(up_b.getvalue(), up_b.name, sheet_b)
+    df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
+    df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
@@ -321,13 +317,13 @@ if run:
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.markdown(f"**⏳ Reading {up_a.name} into memory... (Excel files may take a minute)**")
+    status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**")
     progress_bar.progress(10)
-    df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_a_full = load_data(up_a, up_a.name, sheet_a)
     
-    status_text.markdown(f"**⏳ Reading {up_b.name} into memory... (Almost there)**")
+    status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**")
     progress_bar.progress(35)
-    df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
+    df_b_full = load_data(up_b, up_b.name, sheet_b)
 
     results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
@@ -350,11 +346,11 @@ tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 CSV Export"])
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
-    status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses", on_change=reset_exports)
-    search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...", on_change=reset_exports)
+    status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses")
+    search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
     
     sort_opts = ["Δ Change", f"{val_col} (File A)", f"{val_col} (File B)", "Status", " › ".join(key_cols)]
-    sort_by = fc3.selectbox("Sort Data By", sort_opts, on_change=reset_exports)
+    sort_by = fc3.selectbox("Sort Data By", sort_opts)
 
     view = results 
     if status_filter: view = view[view["Status"].isin(status_filter)]
@@ -378,20 +374,14 @@ with tab_export:
     st.markdown("#### Download CSV Report")
     st.caption("Downloads the current filtered view as a fast, lightweight CSV file.")
     
-    if "csv_data" not in st.session_state:
-        if st.button("⚙️ Generate CSV File", width="stretch", type="primary"):
-            with st.spinner("Preparing CSV data..."):
-                st.session_state["csv_data"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
-            st.rerun() 
-    else:
-        st.download_button(
-            "⬇️ Download CSV File", 
-            data=st.session_state["csv_data"], 
-            file_name=f"SLA_Report_{val_col}.csv", 
-            mime="text/csv", 
-            width="stretch",
-            type="primary"
-        )
-        if st.button("🗑️ Clear CSV from memory", width="stretch"):
-            del st.session_state["csv_data"]
-            st.rerun()
+    # 1-Click inline generation - fast for < 50MB
+    csv_bytes = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
+    
+    st.download_button(
+        "⬇️ Download CSV File", 
+        data=csv_bytes, 
+        file_name=f"SLA_Report_{val_col}.csv", 
+        mime="text/csv", 
+        width="stretch",
+        type="primary"
+    )
