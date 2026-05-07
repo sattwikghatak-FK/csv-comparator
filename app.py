@@ -121,13 +121,17 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_t
     rename_b = {v: k for k, v in col_map.items()}
     df_b.rename(columns=rename_b, inplace=True)
     
-    # Grab all columns that exist in both datasets
-    common_cols = list(col_map.keys())
-
     # ANTI-CRASH GUARD: Ensure all key columns exist
     for k in key_cols:
         if k not in df_a.columns: df_a[k] = "MISSING_IN_A"
         if k not in df_b.columns: df_b[k] = "MISSING_IN_B"
+
+    # DYNAMIC COLUMN DETECTION: Find exactly what lives where without hardcoding names
+    cols_a_all = list(df_a.columns)
+    cols_b_all = list(df_b.columns)
+    common_cols = [c for c in cols_a_all if c in cols_b_all]
+    only_a = [c for c in cols_a_all if c not in cols_b_all]
+    only_b = [c for c in cols_b_all if c not in cols_a_all]
 
     def make_key(df, cols):
         if len(cols) == 1: return df[cols[0]].astype(str)
@@ -140,19 +144,8 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_t
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
-    # NEW: Keep ALL common columns, not just the required ones
-    need = ["__key__"] + common_cols
-    need = list(dict.fromkeys(need)) # Deduplicate list safely
-    
-    for c in need:
-        if c not in df_a.columns: df_a[c] = np.nan
-        if c not in df_b.columns: df_b[c] = np.nan
-
-    update_ui("Deduplicating keys to prepare for merge...", 40)
-    df_a = df_a[need].drop_duplicates("__key__")
-    df_b = df_b[need].drop_duplicates("__key__")
-
-    update_ui("Merging massive datasets (this may take a moment)...", 60)
+    # We DO NOT subset or drop columns here anymore. We take the entire datasets into the merge.
+    update_ui("Merging massive datasets (1-to-Many dynamic mapping)...", 60)
     merged = pd.merge(
         df_a.rename(columns={val_col: "_val_A"}),
         df_b.rename(columns={val_col: "_val_B"}),
@@ -179,14 +172,14 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_t
     ]
     merged["Status"] = np.select(conditions, ["New", "Removed", "Degraded", "Improved"], default="Same")
 
-    update_ui("Coalescing contextual columns...", 90)
-    # NEW: Merge the extra contextual columns from A and B cleanly so we don't have messy _A and _B suffixes
-    cols_to_coalesce = [c for c in common_cols if c != val_col]
+    update_ui("Coalescing dynamic contextual columns...", 90)
+    # Automatically merge columns that exist in both files, prioritizing File B (Current)
+    cols_to_coalesce = [c for c in common_cols if c not in ["__key__", val_col]]
     for c in cols_to_coalesce:
         col_a = f"{c}_A"
         col_b = f"{c}_B"
         if col_a in merged.columns and col_b in merged.columns:
-            merged[c] = merged.get(col_a, pd.Series(dtype=str)).combine_first(merged.get(col_b, pd.Series(dtype=str)))
+            merged[c] = merged[col_b].combine_first(merged[col_a])
             merged.drop(columns=[col_a, col_b], inplace=True)
         elif col_a in merged.columns:
             merged.rename(columns={col_a: c}, inplace=True)
@@ -206,17 +199,25 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_t
         "_val_B": f"{val_col} (File B)",
     }, inplace=True)
 
-    # Base structural columns that should appear first
+    # Base structured columns go first
     base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
     
-    # All other contextual columns append to the end
-    context_cols = [c for c in common_cols if c not in base_cols and c != val_col]
+    # Dynamically append every other column (whether it was in both files, just File A, or just File B)
+    all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in ["__key__", val_col]]
+    
+    # Deduplicate the list to ensure neatness
+    context_cols = []
+    for c in all_context:
+        if c not in context_cols and c in merged.columns:
+            context_cols.append(c)
+            
     final_cols = base_cols + context_cols
+    
+    # Drop strict duplicates in case of a pure Cartesian join overlap
+    merged = merged.drop_duplicates()
     
     update_ui("Analysis Complete! 🚀", 100)
     return merged[[c for c in final_cols if c in merged.columns]]
-
-
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def row_style(row):
         bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
