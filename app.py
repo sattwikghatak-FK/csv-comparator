@@ -96,6 +96,16 @@ def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
     vals = df[col].dropna().head(sample)
     if vals.empty: return False
     return pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6
+def infer_direction(val_col: str) -> str:
+    name = normalise_col_name(val_col)
+    positive_keywords = ["score", "rating", "accuracy", "fill", "efficiency",
+                         "utilisation", "utilization", "revenue", "profit",
+                         "coverage", "success", "satisfaction", "nps"]
+    for kw in positive_keywords:
+        if kw in name: return "higher_is_better"
+    return "higher_is_worse"
+
+
 
 def make_key(df, cols):
     if len(cols) == 1: return df[cols[0]].astype(str)
