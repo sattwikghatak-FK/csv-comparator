@@ -189,10 +189,19 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.Da
     return merged[[c for c in final_cols if c in merged.columns]]
     
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    def row_bg(row):
-        return [f"background-color:{STATUS_META.get(row['Status'],{}).get('bg','#fff')}"] * len(row)
+    def row_style(row):
+        # Fetch both the background and text color from STATUS_META
+        bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
+        
+        # Use a dark text color explicitly so it overrides Streamlit's Dark Mode white text
+        # If it's a "Same" status or unknown, default to a dark gray (#1e293b)
+        text_color = STATUS_META.get(row['Status'], {}).get('color', '#1e293b')
+        
+        return [f"background-color: {bg_color}; color: {text_color};"] * len(row)
 
     df = df.copy()
+    
+    # Coerce numeric cols explicitly before formatting
     for c in df.columns:
         if c not in ("Status", "Group") and not c.endswith("(File A)") is False:
             try:
@@ -202,8 +211,13 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             except Exception: pass
 
     num_fmt = {c: "{:,.4g}" for c in df.columns if pd.api.types.is_numeric_dtype(df[c])}
-    return df.style.apply(row_bg, axis=1).format(num_fmt, na_rep="—").set_properties(**{"font-size": "13px"})
-
+    
+    return (
+        df.style
+        .apply(row_style, axis=1)
+        .format(num_fmt, na_rep="—")
+        .set_properties(**{"font-size": "13px", "font-weight": "500"})
+    )
 def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
