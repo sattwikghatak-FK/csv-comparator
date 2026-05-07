@@ -78,24 +78,26 @@ def match_columns(cols_a: list, cols_b: list) -> dict:
             mapping[ca] = nb
     return mapping   
 
-@st.cache_data(show_spinner=False)
-def get_sheet_names(file_bytes: bytes) -> list:
-    xls = pd.ExcelFile(BytesIO(file_bytes))
+# Removed caching to prevent Streamlit from hash-freezing on large files
+def get_sheet_names(file) -> list:
+    file.seek(0)
+    xls = pd.ExcelFile(file)
     return xls.sheet_names
 
-@st.cache_data(show_spinner=False)
-def get_preview_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    file.seek(0)
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
+        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
     else:
-        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
+        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
     return clean_df(df)
 
-def load_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+def load_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    file.seek(0)
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False)
+        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
     else:
-        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
+        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
 
 def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
@@ -199,15 +201,24 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
             elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
             elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
 
-        processed_chunks.append(merged)
+        if not merged.empty:
+            processed_chunks.append(merged)
         
         del sub_a, sub_b, merged
         gc.collect()
 
     update_ui("Assembling final dataset...", 95)
-    final_merged = pd.concat(processed_chunks, ignore_index=True)
     
-    final_merged["Group"] = final_merged[grp_col] if grp_col and grp_col in final_merged.columns else "All"
+    if processed_chunks:
+        final_merged = pd.concat(processed_chunks, ignore_index=True)
+    else:
+        final_merged = pd.DataFrame() # Fallback for completely empty comparisons
+    
+    # Safe grouping to prevent dropping NaN groups
+    if grp_col and grp_col in final_merged.columns:
+        final_merged["Group"] = final_merged[grp_col].fillna("Unknown")
+    else:
+        final_merged["Group"] = "All"
     
     key_display = " › ".join(key_cols)
     final_merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
@@ -264,7 +275,8 @@ def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
                             ws.write(ri, ci, "" if pd.isna(val) else val, cell_fmt)
 
         summary_data = []
-        for grp, gdf in results.groupby("Group", sort=True):
+        # dropna=False ensures "Unknown" groups aren't skipped
+        for grp, gdf in results.groupby("Group", sort=True, dropna=False):
             sc = gdf["Status"].value_counts()
             avg_a, avg_b = pd.to_numeric(gdf[f"{val_col} (File A)"], errors="coerce").mean(), pd.to_numeric(gdf[f"{val_col} (File B)"], errors="coerce").mean()
             summary_data.append({
@@ -276,7 +288,7 @@ def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
         write_sheet(results, "All Results")
         
-        for grp, gdf in results.groupby("Group", sort=True):
+        for grp, gdf in results.groupby("Group", sort=True, dropna=False):
             if grp != "All" and len(gdf) > 0: write_sheet(gdf, str(grp))
             
     return buf.getvalue()
@@ -294,19 +306,19 @@ with st.container(border=True):
     with c1:
         st.markdown("**📁 File A — Baseline / Previous**")
         up_a = st.file_uploader("File A", type=["csv", "xlsx"], key="fa", label_visibility="collapsed", on_change=reset_computation)
-        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a.getvalue()), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
+        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
     with c2:
         st.markdown("**📁 File B — Current / New**")
         up_b = st.file_uploader("File B", type=["csv", "xlsx"], key="fb", label_visibility="collapsed", on_change=reset_computation)
-        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b.getvalue()), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
+        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
 
 if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
 with st.spinner("Extracting headers and detecting data types..."):
-    df_a_preview = get_preview_data(up_a.getvalue(), up_a.name, sheet_a)
-    df_b_preview = get_preview_data(up_b.getvalue(), up_b.name, sheet_b)
+    df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
+    df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
@@ -357,11 +369,11 @@ if run:
     
     status_text.markdown(f"**⏳ Reading {up_a.name} into memory... (Excel files may take a minute)**")
     progress_bar.progress(10)
-    df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_a_full = load_data(up_a, up_a.name, sheet_a)
     
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory... (Almost there)**")
     progress_bar.progress(35)
-    df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
+    df_b_full = load_data(up_b, up_b.name, sheet_b)
 
     results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
@@ -384,14 +396,12 @@ tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Report
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
-    # Added `on_change=reset_exports` to reset generated files when filters change
     status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses", on_change=reset_exports)
     search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...", on_change=reset_exports)
     
     sort_opts = ["Δ Change", f"{val_col} (File A)", f"{val_col} (File B)", "Status", " › ".join(key_cols)]
     sort_by = fc3.selectbox("Sort Data By", sort_opts, on_change=reset_exports)
 
-    # Removed .copy() to save ~100-200MB of RAM
     view = results 
     if status_filter: view = view[view["Status"].isin(status_filter)]
     if search: view = view[view[" › ".join(key_cols)].astype(str).str.contains(search, case=False, na=False)]
@@ -399,7 +409,8 @@ with tab_data:
 
     st.caption(f"Showing **{len(view):,}** of **{len(results):,}** rows across **{view['Group'].nunique()}** group(s)")
 
-    for grp_name, grp_df in view.groupby("Group", sort=True):
+    # dropna=False ensures groups with missing data are not dropped
+    for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
         gc = grp_df["Status"].value_counts()
         badges = "  ".join(f"{STATUS_META[s]['icon']} {s}: {gc.get(s,0)}" for s in STATUS_ORDER if gc.get(s, 0) > 0)
         grp_label = "Overall Dataset" if grp_name == "All" else f"{grp_col}: {grp_name}"
