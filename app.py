@@ -30,8 +30,14 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
-    """Clear cached results when inputs change to prevent UI distortion and stale data."""
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "excel_data"]:
+    """Clear everything when core inputs change."""
+    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "excel_data", "csv_data"]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+def reset_exports():
+    """Clear generated files when UI filters are changed."""
+    for key in ["excel_data", "csv_data"]:
         if key in st.session_state:
             del st.session_state[key]
 
@@ -85,7 +91,6 @@ def get_preview_data(file_bytes: bytes, file_name: str, sheet_name: str = None) 
         df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
     return clean_df(df)
 
-@st.cache_data(show_spinner=False)
 def load_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
     if file_name.lower().endswith('.xlsx'):
         df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False)
@@ -122,7 +127,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
 
     df_a, df_b = df_a.copy(), df_b.copy()
 
-    update_ui("Aligning columns and padding missing data...", 5)
+    update_ui("Aligning columns and padding missing data...", 55)
     df_b.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
     
     for k in key_cols:
@@ -134,11 +139,11 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
     only_a = [c for c in cols_a_all if c not in cols_b_all]
     only_b = [c for c in cols_b_all if c not in cols_a_all]
 
-    update_ui("Generating composite keys...", 10)
+    update_ui("Generating composite keys...", 60)
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
-    update_ui("Preparing memory chunks...", 15)
+    update_ui("Preparing memory chunks...", 65)
     all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
     
     CHUNK_SIZE = 50000 
@@ -152,8 +157,8 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
         else: dedup_a = False
 
     for i in range(num_chunks):
-        chunk_pct = 15 + int(75 * (i / num_chunks))
-        update_ui(f"Processing chunk {i+1} of {num_chunks} ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} identifiers)...", chunk_pct)
+        chunk_pct = 65 + int(25 * (i / num_chunks)) 
+        update_ui(f"Calculating chunk {i+1} of {num_chunks} ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} identifiers)...", chunk_pct)
         
         chunk_keys = all_keys[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
         
@@ -237,7 +242,6 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
 def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
     buf = BytesIO()
-    # constant_memory=True prevents RAM exhaustion when writing massive Excel files
     with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={'options': {'constant_memory': True}}) as writer:
         wb = writer.book
         fmt = {s: wb.add_format({"bg_color": STATUS_META[s]["bg"], "font_size": 11}) for s in STATUS_META}
@@ -272,7 +276,6 @@ def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
         write_sheet(results, "All Results")
         
-        # Write individual group sheets, protecting against empty sheets
         for grp, gdf in results.groupby("Group", sort=True):
             if grp != "All" and len(gdf) > 0: write_sheet(gdf, str(grp))
             
@@ -352,10 +355,12 @@ if run:
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    status_text.markdown("**⏳ Loading full datasets into memory...**")
-    progress_bar.progress(5)
-    
+    status_text.markdown(f"**⏳ Reading {up_a.name} into memory... (Excel files may take a minute)**")
+    progress_bar.progress(10)
     df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
+    
+    status_text.markdown(f"**⏳ Reading {up_b.name} into memory... (Almost there)**")
+    progress_bar.progress(35)
     df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
 
     results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
@@ -379,12 +384,15 @@ tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Report
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
-    status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses")
-    search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
+    # Added `on_change=reset_exports` to reset generated files when filters change
+    status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses", on_change=reset_exports)
+    search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...", on_change=reset_exports)
+    
     sort_opts = ["Δ Change", f"{val_col} (File A)", f"{val_col} (File B)", "Status", " › ".join(key_cols)]
-    sort_by = fc3.selectbox("Sort Data By", sort_opts)
+    sort_by = fc3.selectbox("Sort Data By", sort_opts, on_change=reset_exports)
 
-    view = results.copy()
+    # Removed .copy() to save ~100-200MB of RAM
+    view = results 
     if status_filter: view = view[view["Status"].isin(status_filter)]
     if search: view = view[view[" › ".join(key_cols)].astype(str).str.contains(search, case=False, na=False)]
     if sort_by in view.columns: view = view.sort_values(sort_by, ascending=(sort_by == "Status"), na_position="last")
@@ -407,14 +415,23 @@ with tab_export:
     ec1, ec2 = st.columns(2)
     
     with ec1:
-        st.download_button(
-            "⬇️ Download Filtered View (CSV)", 
-            data=view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode(), 
-            file_name=f"SLA_filtered_{val_col}.csv", 
-            mime="text/csv", 
-            width="stretch"
-        )
-        
+        if "csv_data" not in st.session_state:
+            if st.button("⚙️ Generate CSV Report", width="stretch"):
+                with st.spinner("Preparing CSV data..."):
+                    st.session_state["csv_data"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
+                st.rerun() 
+        else:
+            st.download_button(
+                "⬇️ Download Filtered View (CSV)", 
+                data=st.session_state["csv_data"], 
+                file_name=f"SLA_filtered_{val_col}.csv", 
+                mime="text/csv", 
+                width="stretch"
+            )
+            if st.button("🗑️ Clear CSV from memory", width="stretch", key="clear_csv"):
+                del st.session_state["csv_data"]
+                st.rerun()
+                
     with ec2:
         if "excel_data" not in st.session_state:
             if st.button("⚙️ Generate Excel Report (Takes Time)", width="stretch", type="primary"):
@@ -430,6 +447,6 @@ with tab_export:
                 width="stretch", 
                 type="primary"
             )
-            if st.button("🗑️ Clear Excel from memory", width="stretch"):
+            if st.button("🗑️ Clear Excel from memory", width="stretch", key="clear_excel"):
                 del st.session_state["excel_data"]
                 st.rerun()
