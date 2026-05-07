@@ -109,52 +109,62 @@ def infer_direction(val_col: str) -> str:
         if kw in name: return "higher_is_better"
     return "higher_is_worse"
 
-def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.DataFrame:
+def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None) -> pd.DataFrame:
+    def update_ui(msg, pct):
+        if status_text: status_text.markdown(f"**⏳ {msg}**")
+        if progress_bar: progress_bar.progress(pct)
+
     df_a = df_a.copy()
     df_b = df_b.copy()
 
-    # 1. Rename df_b columns to match df_a's structure using our safe map
+    update_ui("Aligning columns and padding missing data...", 10)
     rename_b = {v: k for k, v in col_map.items()}
     df_b.rename(columns=rename_b, inplace=True)
+    
+    # Grab all columns that exist in both datasets
+    common_cols = list(col_map.keys())
 
-    # 2. ANTI-CRASH GUARD: Ensure all key columns exist. 
-    # If a file is completely missing the column, pad it to prevent KeyErrors.
+    # ANTI-CRASH GUARD: Ensure all key columns exist
     for k in key_cols:
         if k not in df_a.columns: df_a[k] = "MISSING_IN_A"
         if k not in df_b.columns: df_b[k] = "MISSING_IN_B"
 
     def make_key(df, cols):
-        """Vectorized key generation for massive datasets"""
-        if len(cols) == 1:
-            return df[cols[0]].astype(str)
+        if len(cols) == 1: return df[cols[0]].astype(str)
         res = df[cols[0]].astype(str)
         for col in cols[1:]:
             res += " › " + df[col].astype(str)
         return res
 
+    update_ui("Generating composite keys...", 25)
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
-    # 3. ANTI-CRASH GUARD: Ensure Value and Group columns exist before subsetting.
-    need = ["__key__", val_col] + ([grp_col] if grp_col else [])
+    # NEW: Keep ALL common columns, not just the required ones
+    need = ["__key__"] + common_cols
+    need = list(dict.fromkeys(need)) # Deduplicate list safely
+    
     for c in need:
         if c not in df_a.columns: df_a[c] = np.nan
         if c not in df_b.columns: df_b[c] = np.nan
 
-    # Strip unnecessary columns early to save RAM before outer join
+    update_ui("Deduplicating keys to prepare for merge...", 40)
     df_a = df_a[need].drop_duplicates("__key__")
     df_b = df_b[need].drop_duplicates("__key__")
 
+    update_ui("Merging massive datasets (this may take a moment)...", 60)
     merged = pd.merge(
         df_a.rename(columns={val_col: "_val_A"}),
         df_b.rename(columns={val_col: "_val_B"}),
         on="__key__", how="outer", suffixes=("_A", "_B"),
     )
 
+    update_ui("Calculating SLA differences...", 75)
     merged["_val_A"] = pd.to_numeric(merged["_val_A"], errors="coerce")
     merged["_val_B"] = pd.to_numeric(merged["_val_B"], errors="coerce")
     merged["Δ Change"] = merged["_val_B"] - merged["_val_A"]
 
+    update_ui("Evaluating Status (Improved/Degraded)...", 85)
     if higher_is == "higher_is_worse":
         deg_cond = merged["_val_B"] > merged["_val_A"]
         imp_cond = merged["_val_B"] < merged["_val_A"]
@@ -169,12 +179,23 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.Da
     ]
     merged["Status"] = np.select(conditions, ["New", "Removed", "Degraded", "Improved"], default="Same")
 
-    if grp_col:
-        ga = f"{grp_col}_A" if f"{grp_col}_A" in merged.columns else grp_col
-        gb = f"{grp_col}_B" if f"{grp_col}_B" in merged.columns else grp_col
-        merged["Group"] = merged.get(ga, pd.Series(dtype=str)).combine_first(merged.get(gb, pd.Series(dtype=str)))
-        drop = [c for c in [ga, gb] if c in merged.columns and c != "Group"]
-        merged.drop(columns=drop, inplace=True)
+    update_ui("Coalescing contextual columns...", 90)
+    # NEW: Merge the extra contextual columns from A and B cleanly so we don't have messy _A and _B suffixes
+    cols_to_coalesce = [c for c in common_cols if c != val_col]
+    for c in cols_to_coalesce:
+        col_a = f"{c}_A"
+        col_b = f"{c}_B"
+        if col_a in merged.columns and col_b in merged.columns:
+            merged[c] = merged.get(col_a, pd.Series(dtype=str)).combine_first(merged.get(col_b, pd.Series(dtype=str)))
+            merged.drop(columns=[col_a, col_b], inplace=True)
+        elif col_a in merged.columns:
+            merged.rename(columns={col_a: c}, inplace=True)
+        elif col_b in merged.columns:
+            merged.rename(columns={col_b: c}, inplace=True)
+
+    update_ui("Finalizing grouping and formatting...", 95)
+    if grp_col and grp_col in merged.columns:
+        merged["Group"] = merged[grp_col]
     else:
         merged["Group"] = "All"
 
@@ -185,25 +206,28 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.Da
         "_val_B": f"{val_col} (File B)",
     }, inplace=True)
 
-    final_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-    return merged[[c for c in final_cols if c in merged.columns]]
+    # Base structural columns that should appear first
+    base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
     
+    # All other contextual columns append to the end
+    context_cols = [c for c in common_cols if c not in base_cols and c != val_col]
+    final_cols = base_cols + context_cols
+    
+    update_ui("Analysis Complete! 🚀", 100)
+    return merged[[c for c in final_cols if c in merged.columns]]
+
+
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def row_style(row):
-        # Fetch both the background and text color from STATUS_META
         bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
-        
-        # Use a dark text color explicitly so it overrides Streamlit's Dark Mode white text
-        # If it's a "Same" status or unknown, default to a dark gray (#1e293b)
         text_color = STATUS_META.get(row['Status'], {}).get('color', '#1e293b')
-        
         return [f"background-color: {bg_color}; color: {text_color};"] * len(row)
 
     df = df.copy()
     
-    # Coerce numeric cols explicitly before formatting
+    # Safely format ONLY the target metrics as numbers, leaving context columns (like IDs/Pincodes) alone
     for c in df.columns:
-        if c not in ("Status", "Group") and not c.endswith("(File A)") is False:
+        if c in ["Δ Change"] or c.endswith("(File A)") or c.endswith("(File B)"):
             try:
                 converted = pd.to_numeric(df[c], errors="coerce")
                 if converted.notna().sum() > 0:
@@ -218,6 +242,8 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         .format(num_fmt, na_rep="—")
         .set_properties(**{"font-size": "13px", "font-weight": "500"})
     )
+
+
 def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
