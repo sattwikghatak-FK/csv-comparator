@@ -13,10 +13,7 @@ st.markdown("""
         background: #f8fafc; border: 1px solid #e2e8f0;
         border-radius: 12px; padding: 12px 16px;
     }
-    /* Smooth transitions for expanders */
-    .streamlit-expanderHeader {
-        font-weight: 600 !important;
-    }
+    .streamlit-expanderHeader { font-weight: 600 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -37,7 +34,7 @@ def reset_computation():
         if key in st.session_state:
             del st.session_state[key]
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Data Processing Helpers ───────────────────────────────────────────────────
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     
@@ -55,8 +52,11 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
     df.dropna(how="all", inplace=True)
     df.dropna(axis=1, how="all", inplace=True)
 
-    str_cols = df.select_dtypes(include="object").columns
-    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip() if hasattr(s, 'str') else s)
+    # Vectorized string stripping for maximum performance on huge datasets
+    str_cols = df.select_dtypes(include=["object", "string"]).columns
+    for c in str_cols:
+        df[c] = df[c].str.strip()
+        
     df.replace("", np.nan, inplace=True)
     return df
 
@@ -78,14 +78,24 @@ def get_sheet_names(file_bytes: bytes) -> list:
     return xls.sheet_names
 
 @st.cache_data(show_spinner=False)
+def get_preview_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    """Reads only the first 2000 rows to quickly map columns and infer datatypes without freezing the UI."""
+    if file_name.lower().endswith('.xlsx'):
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
+    else:
+        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
+    return clean_df(df)
+
+@st.cache_data(show_spinner=False)
 def load_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
+    """Reads the full dataset during the final compute run."""
     if file_name.lower().endswith('.xlsx'):
         df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False)
     else:
         df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
 
-def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 500) -> bool:
+def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
     vals = df[col].dropna().head(sample)
     if vals.empty: return False
     return pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6
@@ -103,18 +113,37 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.Da
     df_a = df_a.copy()
     df_b = df_b.copy()
 
+    # 1. Rename df_b columns to match df_a's structure using our safe map
     rename_b = {v: k for k, v in col_map.items()}
     df_b.rename(columns=rename_b, inplace=True)
 
+    # 2. ANTI-CRASH GUARD: Ensure all key columns exist. 
+    # If a file is completely missing the column, pad it to prevent KeyErrors.
+    for k in key_cols:
+        if k not in df_a.columns: df_a[k] = "MISSING_IN_A"
+        if k not in df_b.columns: df_b[k] = "MISSING_IN_B"
+
     def make_key(df, cols):
-        return df[cols].astype(str).agg(" › ".join, axis=1) if len(cols) > 1 else df[cols[0]].astype(str)
+        """Vectorized key generation for massive datasets"""
+        if len(cols) == 1:
+            return df[cols[0]].astype(str)
+        res = df[cols[0]].astype(str)
+        for col in cols[1:]:
+            res += " › " + df[col].astype(str)
+        return res
 
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
+    # 3. ANTI-CRASH GUARD: Ensure Value and Group columns exist before subsetting.
     need = ["__key__", val_col] + ([grp_col] if grp_col else [])
-    df_a = df_a[[c for c in need if c in df_a.columns]].drop_duplicates("__key__")
-    df_b = df_b[[c for c in need if c in df_b.columns]].drop_duplicates("__key__")
+    for c in need:
+        if c not in df_a.columns: df_a[c] = np.nan
+        if c not in df_b.columns: df_b[c] = np.nan
+
+    # Strip unnecessary columns early to save RAM before outer join
+    df_a = df_a[need].drop_duplicates("__key__")
+    df_b = df_b[need].drop_duplicates("__key__")
 
     merged = pd.merge(
         df_a.rename(columns={val_col: "_val_A"}),
@@ -158,7 +187,7 @@ def compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is) -> pd.Da
 
     final_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
     return merged[[c for c in final_cols if c in merged.columns]]
-
+    
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def row_bg(row):
         return [f"background-color:{STATUS_META.get(row['Status'],{}).get('bg','#fff')}"] * len(row)
@@ -218,7 +247,7 @@ def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
 st.title("📊 SLA Comparator")
-st.caption("Compare CSV/Excel datasets seamlessly · Case-insensitive matching · Intelligent status inference")
+st.caption("Compare massive CSV/Excel datasets seamlessly · Optimized for speed")
 
 # ── Step 1: Upload ─────────────────────────────────────────────────────────────
 with st.container(border=True):
@@ -242,18 +271,18 @@ with st.container(border=True):
             sheet_b = st.selectbox("📝 Select Sheet (File B)", sheets_b, on_change=reset_computation)
 
 if not (up_a and up_b):
-    st.info("⬆ Upload both files (CSV or Excel) to configure your comparison.", icon="ℹ️")
+    st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
-with st.spinner("Parsing & mapping datasets…"):
-    df_a = load_data(up_a.getvalue(), up_a.name, sheet_a)
-    df_b = load_data(up_b.getvalue(), up_b.name, sheet_b)
+# Generate previews instantly (nrows=2000) so UI doesn't lag on 900k row files
+with st.spinner("Extracting headers and detecting data types..."):
+    df_a_preview = get_preview_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_b_preview = get_preview_data(up_b.getvalue(), up_b.name, sheet_b)
 
-# Case-insensitive column matching
-col_map = match_columns(list(df_a.columns), list(df_b.columns))
-common    = list(col_map.keys())
-only_a    = [c for c in df_a.columns if c not in col_map]
-only_b    = [c for c in df_b.columns if c not in col_map.values()]
+col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
+common  = list(col_map.keys())
+only_a  = [c for c in df_a_preview.columns if c not in col_map]
+only_b  = [c for c in df_b_preview.columns if c not in col_map.values()]
 
 if not common:
     st.error("No matching columns found between the two files. Please verify headers.")
@@ -263,7 +292,8 @@ if not common:
 with st.container(border=True):
     st.markdown("#### 2. Configure Comparison")
     
-    numeric_cols = [c for c in common if sniff_numeric(df_a, c) or sniff_numeric(df_b, c)]
+    # FIXED: Map column name specifically to File B's name format to prevent KeyErrors
+    numeric_cols = [c for c in common if sniff_numeric(df_a_preview, c) or sniff_numeric(df_b_preview, col_map[c])]
     
     cfg1, cfg2, cfg3 = st.columns([2, 1, 1])
     with cfg1:
@@ -286,7 +316,8 @@ with st.container(border=True):
         horizontal=True, on_change=reset_computation
     )
 
-    run = st.button("🚀 Run Analysis", type="primary", use_container_width=True, disabled=not (key_cols and val_col))
+    # ── Master Run Button ──
+    run = st.button("🚀 Run Full Analysis", type="primary", use_container_width=True, disabled=not (key_cols and val_col))
 
 if not run and "results" not in st.session_state:
     with st.expander("🔍 View Column Mapping Details"):
@@ -298,8 +329,13 @@ if not run and "results" not in st.session_state:
 
 # ── Step 3: Compute ────────────────────────────────────────────────────────────
 if run:
-    with st.spinner(f"Analyzing {len(df_a) + len(df_b):,} total rows..."):
-        results = compare(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is)
+    with st.spinner("⏳ Loading large datasets into memory..."):
+        df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
+        df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
+
+    with st.spinner(f"🚀 Processing logic on {len(df_a_full) + len(df_b_full):,} combined rows..."):
+        results = compare(df_a_full, df_b_full, col_map, key_cols, val_col, grp_col, higher_is)
+        
     st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
 
 # Pull from session state
@@ -319,11 +355,9 @@ for i, s in enumerate(STATUS_ORDER):
 
 st.markdown("")
 
-# Using tabs for a cleaner, app-like view
 tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Reports"])
 
 with tab_data:
-    # Inline Filters
     fc1, fc2, fc3 = st.columns([2, 2, 1])
     status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER, default=[], placeholder="All statuses")
     search = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
@@ -347,7 +381,10 @@ with tab_data:
         
         with st.expander(f"{grp_label} ({len(grp_df):,} rows)  |  {badges}", expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
             show = grp_df.drop(columns=["Group"], errors="ignore")
-            st.dataframe(style_table(show), use_container_width=True, height=min(500, 45 + len(show) * 36))
+            # Limit render rows in preview so the UI doesn't crash visually
+            st.dataframe(style_table(show.head(1500)), use_container_width=True, height=min(500, 45 + len(show) * 36))
+            if len(show) > 1500:
+                st.warning(f"⚠️ Showing first 1,500 rows for UI performance. Please export to view all {len(show):,} rows in Excel.")
 
 with tab_export:
     st.markdown("#### Download your insights")
