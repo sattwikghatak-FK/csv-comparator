@@ -31,15 +31,14 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
     """Clear everything when core inputs change."""
-    for key in list(st.session_state.keys()):
-        if key in ["results", "key_cols", "val_col", "grp_col", "higher_is"] or key.startswith("csv_"):
+    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "csv_data"]:
+        if key in st.session_state:
             del st.session_state[key]
 
 def reset_exports():
-    """Clear generated CSVs when UI filters are changed."""
-    for key in list(st.session_state.keys()):
-        if key.startswith("csv_"):
-            del st.session_state[key]
+    """Clear generated CSV when UI filters are changed."""
+    if "csv_data" in st.session_state:
+        del st.session_state["csv_data"]
 
 # ── Data Processing Helpers ───────────────────────────────────────────────────
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -348,7 +347,7 @@ for i, s in enumerate(STATUS_ORDER):
     cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{sc.get(s, 0):,}")
 
 st.markdown("")
-tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 CSV Export Hub"])
+tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Data"])
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
@@ -376,74 +375,24 @@ with tab_data:
             if len(show) > 1500:
                 st.warning(f"⚠️ Showing first 1,500 rows for UI performance. Please export CSV to view all {len(show):,} rows.")
 
-# ── New Modular CSV Export Hub ────────────────────────────────────────────────
 with tab_export:
-    st.markdown("#### 📥 Modular CSV Exports")
-    st.caption("Excel logic has been replaced with lightweight CSVs to prevent memory crashes on massive datasets.")
+    st.markdown("#### Download CSV Report")
+    st.caption("Downloads the current filtered view as a simple CSV file.")
     
-    ec1, ec2, ec3 = st.columns(3)
-    
-    # 1. Filtered View Export
-    with ec1:
-        st.markdown("**1. Current Filtered View**")
-        if "csv_filtered" not in st.session_state:
-            if st.button("⚙️ Generate Filtered CSV", width="stretch"):
-                with st.spinner("Building Filtered CSV..."):
-                    st.session_state["csv_filtered"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
-                st.rerun()
-        else:
-            st.download_button("⬇️ Download Filtered Data", data=st.session_state["csv_filtered"], file_name=f"SLA_Filtered_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
-            if st.button("🗑️ Clear Filtered CSV", width="stretch"):
-                del st.session_state["csv_filtered"]
-                st.rerun()
-
-    # 2. Summary Statistics Export
-    with ec2:
-        st.markdown("**2. Summary Statistics**")
-        if "csv_summary" not in st.session_state:
-            if st.button("⚙️ Generate Summary CSV", width="stretch"):
-                with st.spinner("Calculating Summary..."):
-                    summary_data = []
-                    for grp, gdf in results.groupby("Group", sort=True, dropna=False):
-                        sc = gdf["Status"].value_counts()
-                        avg_a = pd.to_numeric(gdf[f"{val_col} (File A)"], errors="coerce").mean()
-                        avg_b = pd.to_numeric(gdf[f"{val_col} (File B)"], errors="coerce").mean()
-                        summary_data.append({
-                            "Group": grp, "Total Rows": len(gdf),
-                            **{s: sc.get(s, 0) for s in STATUS_ORDER},
-                            f"Avg {val_col} (A)": round(avg_a, 4) if not np.isnan(avg_a) else "",
-                            f"Avg {val_col} (B)": round(avg_b, 4) if not np.isnan(avg_b) else "",
-                        })
-                    st.session_state["csv_summary"] = pd.DataFrame(summary_data).to_csv(index=False).encode('utf-8')
-                st.rerun()
-        else:
-            st.download_button("⬇️ Download Summary", data=st.session_state["csv_summary"], file_name=f"SLA_Summary_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
-            if st.button("🗑️ Clear Summary CSV", width="stretch"):
-                del st.session_state["csv_summary"]
-                st.rerun()
-
-    # 3. Target Export (All Results or specific Group)
-    with ec3:
-        st.markdown("**3. Raw Data Export**")
-        # Ensure 'All Results' is the first option, followed by dynamic groups
-        target_options = ["All Results"] + sorted([str(g) for g in results["Group"].unique() if str(g) != "All"])
-        export_target = st.selectbox("Select Target Data", target_options, label_visibility="collapsed")
-        
-        # Create a dynamic state key based on the target selected
-        state_key = f"csv_raw_{export_target}"
-        
-        if state_key not in st.session_state:
-            if st.button(f"⚙️ Generate {export_target[:12]} CSV", width="stretch"):
-                with st.spinner(f"Building {export_target} CSV..."):
-                    if export_target == "All Results":
-                        target_df = results
-                    else:
-                        target_df = results[results["Group"].astype(str) == export_target]
-                    st.session_state[state_key] = target_df.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
-                st.rerun()
-        else:
-            safe_name = export_target.replace(" ", "_").replace("/", "_")
-            st.download_button(f"⬇️ Download {export_target[:12]}", data=st.session_state[state_key], file_name=f"SLA_{safe_name}_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
-            if st.button(f"🗑️ Clear {export_target[:12]} CSV", width="stretch"):
-                del st.session_state[state_key]
-                st.rerun()
+    if "csv_data" not in st.session_state:
+        if st.button("⚙️ Generate CSV File", width="stretch", type="primary"):
+            with st.spinner("Preparing CSV data..."):
+                st.session_state["csv_data"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
+            st.rerun() 
+    else:
+        st.download_button(
+            "⬇️ Download CSV File", 
+            data=st.session_state["csv_data"], 
+            file_name=f"SLA_Report_{val_col}.csv", 
+            mime="text/csv", 
+            width="stretch",
+            type="primary"
+        )
+        if st.button("🗑️ Clear CSV from memory", width="stretch"):
+            del st.session_state["csv_data"]
+            st.rerun()
