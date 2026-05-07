@@ -31,14 +31,14 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
     """Clear everything when core inputs change."""
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "excel_data", "csv_data"]:
-        if key in st.session_state:
+    for key in list(st.session_state.keys()):
+        if key in ["results", "key_cols", "val_col", "grp_col", "higher_is"] or key.startswith("csv_"):
             del st.session_state[key]
 
 def reset_exports():
-    """Clear generated files when UI filters are changed."""
-    for key in ["excel_data", "csv_data"]:
-        if key in st.session_state:
+    """Clear generated CSVs when UI filters are changed."""
+    for key in list(st.session_state.keys()):
+        if key.startswith("csv_"):
             del st.session_state[key]
 
 # ── Data Processing Helpers ───────────────────────────────────────────────────
@@ -78,7 +78,6 @@ def match_columns(cols_a: list, cols_b: list) -> dict:
             mapping[ca] = nb
     return mapping   
 
-# Removed caching to prevent Streamlit from hash-freezing on large files
 def get_sheet_names(file) -> list:
     file.seek(0)
     xls = pd.ExcelFile(file)
@@ -212,9 +211,8 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
     if processed_chunks:
         final_merged = pd.concat(processed_chunks, ignore_index=True)
     else:
-        final_merged = pd.DataFrame() # Fallback for completely empty comparisons
+        final_merged = pd.DataFrame() 
     
-    # Safe grouping to prevent dropping NaN groups
     if grp_col and grp_col in final_merged.columns:
         final_merged["Group"] = final_merged[grp_col].fillna("Unknown")
     else:
@@ -233,7 +231,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, ke
     update_ui("Analysis Complete! 🚀", 100)
     return final_merged[[c for c in base_cols + context_cols if c in final_merged.columns]]
 
-# ── Styler & Excel Builders ───────────────────────────────────────────────────
+# ── Styler ────────────────────────────────────────────────────────────────────
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def row_style(row):
         bg_color = STATUS_META.get(row['Status'], {}).get('bg', '#ffffff')
@@ -250,48 +248,6 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
     num_fmt = {c: "{:,.4g}" for c in df.columns if pd.api.types.is_numeric_dtype(df[c])}
     return df.style.apply(row_style, axis=1).format(num_fmt, na_rep="—").set_properties(**{"font-size": "13px", "font-weight": "500"})
-
-def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={'options': {'constant_memory': True}}) as writer:
-        wb = writer.book
-        fmt = {s: wb.add_format({"bg_color": STATUS_META[s]["bg"], "font_size": 11}) for s in STATUS_META}
-        hdr_fmt = wb.add_format({"bold": True, "bg_color": "#1e293b", "font_color": "#ffffff", "font_size": 11})
-
-        def write_sheet(df, sheet_name):
-            df = df.drop(columns=["Group"], errors="ignore")
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            ws = writer.sheets[sheet_name[:31]]
-            for ci, col in enumerate(df.columns):
-                ws.write(0, ci, col, hdr_fmt)
-                ws.set_column(ci, ci, max(18, len(str(col)) + 4))
-            status_ci = list(df.columns).index("Status") if "Status" in df.columns else None
-            if status_ci is not None:
-                for ri, status in enumerate(df["Status"], start=1):
-                    cell_fmt = fmt.get(status)
-                    if cell_fmt:
-                        for ci in range(len(df.columns)):
-                            val = df.iloc[ri-1, ci]
-                            ws.write(ri, ci, "" if pd.isna(val) else val, cell_fmt)
-
-        summary_data = []
-        # dropna=False ensures "Unknown" groups aren't skipped
-        for grp, gdf in results.groupby("Group", sort=True, dropna=False):
-            sc = gdf["Status"].value_counts()
-            avg_a, avg_b = pd.to_numeric(gdf[f"{val_col} (File A)"], errors="coerce").mean(), pd.to_numeric(gdf[f"{val_col} (File B)"], errors="coerce").mean()
-            summary_data.append({
-                "Group": grp, "Total Rows": len(gdf),
-                **{s: sc.get(s, 0) for s in STATUS_ORDER},
-                f"Avg {val_col} (A)": round(avg_a, 4) if not np.isnan(avg_a) else "",
-                f"Avg {val_col} (B)": round(avg_b, 4) if not np.isnan(avg_b) else "",
-            })
-        pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
-        write_sheet(results, "All Results")
-        
-        for grp, gdf in results.groupby("Group", sort=True, dropna=False):
-            if grp != "All" and len(gdf) > 0: write_sheet(gdf, str(grp))
-            
-    return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
@@ -392,7 +348,7 @@ for i, s in enumerate(STATUS_ORDER):
     cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{sc.get(s, 0):,}")
 
 st.markdown("")
-tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Reports"])
+tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 CSV Export Hub"])
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
@@ -409,7 +365,6 @@ with tab_data:
 
     st.caption(f"Showing **{len(view):,}** of **{len(results):,}** rows across **{view['Group'].nunique()}** group(s)")
 
-    # dropna=False ensures groups with missing data are not dropped
     for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
         gc = grp_df["Status"].value_counts()
         badges = "  ".join(f"{STATUS_META[s]['icon']} {s}: {gc.get(s,0)}" for s in STATUS_ORDER if gc.get(s, 0) > 0)
@@ -419,45 +374,76 @@ with tab_data:
             show = grp_df.drop(columns=["Group"], errors="ignore")
             st.dataframe(style_table(show.head(1500)), width="stretch", height=min(500, 45 + len(show) * 36))
             if len(show) > 1500:
-                st.warning(f"⚠️ Showing first 1,500 rows for UI performance. Please export to view all {len(show):,} rows.")
+                st.warning(f"⚠️ Showing first 1,500 rows for UI performance. Please export CSV to view all {len(show):,} rows.")
 
+# ── New Modular CSV Export Hub ────────────────────────────────────────────────
 with tab_export:
-    st.markdown("#### Download your insights")
-    ec1, ec2 = st.columns(2)
+    st.markdown("#### 📥 Modular CSV Exports")
+    st.caption("Excel logic has been replaced with lightweight CSVs to prevent memory crashes on massive datasets.")
     
+    ec1, ec2, ec3 = st.columns(3)
+    
+    # 1. Filtered View Export
     with ec1:
-        if "csv_data" not in st.session_state:
-            if st.button("⚙️ Generate CSV Report", width="stretch"):
-                with st.spinner("Preparing CSV data..."):
-                    st.session_state["csv_data"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
-                st.rerun() 
-        else:
-            st.download_button(
-                "⬇️ Download Filtered View (CSV)", 
-                data=st.session_state["csv_data"], 
-                file_name=f"SLA_filtered_{val_col}.csv", 
-                mime="text/csv", 
-                width="stretch"
-            )
-            if st.button("🗑️ Clear CSV from memory", width="stretch", key="clear_csv"):
-                del st.session_state["csv_data"]
+        st.markdown("**1. Current Filtered View**")
+        if "csv_filtered" not in st.session_state:
+            if st.button("⚙️ Generate Filtered CSV", width="stretch"):
+                with st.spinner("Building Filtered CSV..."):
+                    st.session_state["csv_filtered"] = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
                 st.rerun()
-                
-    with ec2:
-        if "excel_data" not in st.session_state:
-            if st.button("⚙️ Generate Excel Report (Takes Time)", width="stretch", type="primary"):
-                with st.spinner("Building massive Excel file... Please wait (this may take a minute)."):
-                    st.session_state["excel_data"] = build_excel(results, val_col)
-                st.rerun() 
         else:
-            st.download_button(
-                "⬇️ Download Full Multi-Sheet Report (Excel)", 
-                data=st.session_state["excel_data"], 
-                file_name=f"SLA_Full_Report_{val_col}.xlsx", 
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-                width="stretch", 
-                type="primary"
-            )
-            if st.button("🗑️ Clear Excel from memory", width="stretch", key="clear_excel"):
-                del st.session_state["excel_data"]
+            st.download_button("⬇️ Download Filtered Data", data=st.session_state["csv_filtered"], file_name=f"SLA_Filtered_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
+            if st.button("🗑️ Clear Filtered CSV", width="stretch"):
+                del st.session_state["csv_filtered"]
+                st.rerun()
+
+    # 2. Summary Statistics Export
+    with ec2:
+        st.markdown("**2. Summary Statistics**")
+        if "csv_summary" not in st.session_state:
+            if st.button("⚙️ Generate Summary CSV", width="stretch"):
+                with st.spinner("Calculating Summary..."):
+                    summary_data = []
+                    for grp, gdf in results.groupby("Group", sort=True, dropna=False):
+                        sc = gdf["Status"].value_counts()
+                        avg_a = pd.to_numeric(gdf[f"{val_col} (File A)"], errors="coerce").mean()
+                        avg_b = pd.to_numeric(gdf[f"{val_col} (File B)"], errors="coerce").mean()
+                        summary_data.append({
+                            "Group": grp, "Total Rows": len(gdf),
+                            **{s: sc.get(s, 0) for s in STATUS_ORDER},
+                            f"Avg {val_col} (A)": round(avg_a, 4) if not np.isnan(avg_a) else "",
+                            f"Avg {val_col} (B)": round(avg_b, 4) if not np.isnan(avg_b) else "",
+                        })
+                    st.session_state["csv_summary"] = pd.DataFrame(summary_data).to_csv(index=False).encode('utf-8')
+                st.rerun()
+        else:
+            st.download_button("⬇️ Download Summary", data=st.session_state["csv_summary"], file_name=f"SLA_Summary_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
+            if st.button("🗑️ Clear Summary CSV", width="stretch"):
+                del st.session_state["csv_summary"]
+                st.rerun()
+
+    # 3. Target Export (All Results or specific Group)
+    with ec3:
+        st.markdown("**3. Raw Data Export**")
+        # Ensure 'All Results' is the first option, followed by dynamic groups
+        target_options = ["All Results"] + sorted([str(g) for g in results["Group"].unique() if str(g) != "All"])
+        export_target = st.selectbox("Select Target Data", target_options, label_visibility="collapsed")
+        
+        # Create a dynamic state key based on the target selected
+        state_key = f"csv_raw_{export_target}"
+        
+        if state_key not in st.session_state:
+            if st.button(f"⚙️ Generate {export_target[:12]} CSV", width="stretch"):
+                with st.spinner(f"Building {export_target} CSV..."):
+                    if export_target == "All Results":
+                        target_df = results
+                    else:
+                        target_df = results[results["Group"].astype(str) == export_target]
+                    st.session_state[state_key] = target_df.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode('utf-8')
+                st.rerun()
+        else:
+            safe_name = export_target.replace(" ", "_").replace("/", "_")
+            st.download_button(f"⬇️ Download {export_target[:12]}", data=st.session_state[state_key], file_name=f"SLA_{safe_name}_{val_col}.csv", mime="text/csv", width="stretch", type="primary")
+            if st.button(f"🗑️ Clear {export_target[:12]} CSV", width="stretch"):
+                del st.session_state[state_key]
                 st.rerun()
