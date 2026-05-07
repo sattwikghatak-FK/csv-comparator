@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import gc
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="SLA Comparator", page_icon="📊", layout="wide")
@@ -29,8 +30,8 @@ STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 # ── State Callbacks ───────────────────────────────────────────────────────────
 def reset_computation():
-    """Clear results when inputs change to prevent stale data views."""
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is"]:
+    """Clear cached results when inputs change to prevent UI distortion and stale data."""
+    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is", "excel_data"]:
         if key in st.session_state:
             del st.session_state[key]
 
@@ -113,15 +114,15 @@ def make_key(df, cols):
         res += " › " + df[col].astype(str)
     return res
 
-# ── Function 1: Strict 1-to-1 Comparison ──────────────────────────────────────
-def compare_strict_1_to_1(df_a, df_b, col_map, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None) -> pd.DataFrame:
+# ── Unified Chunk Processing Engine ───────────────────────────────────────────
+def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None) -> pd.DataFrame:
     def update_ui(msg, pct):
         if status_text: status_text.markdown(f"**⏳ {msg}**")
         if progress_bar: progress_bar.progress(pct)
 
     df_a, df_b = df_a.copy(), df_b.copy()
 
-    update_ui("Aligning columns and padding missing data...", 10)
+    update_ui("Aligning columns and padding missing data...", 5)
     df_b.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
     
     for k in key_cols:
@@ -133,132 +134,88 @@ def compare_strict_1_to_1(df_a, df_b, col_map, key_cols, val_col, grp_col, highe
     only_a = [c for c in cols_a_all if c not in cols_b_all]
     only_b = [c for c in cols_b_all if c not in cols_a_all]
 
-    update_ui("Generating composite keys...", 25)
+    update_ui("Generating composite keys...", 10)
     df_a["__key__"] = make_key(df_a, key_cols)
     df_b["__key__"] = make_key(df_b, key_cols)
 
-    update_ui("Deduplicating rows for strict 1-to-1 match...", 40)
-    df_a = df_a.drop_duplicates("__key__")
-    df_b = df_b.drop_duplicates("__key__")
-
-    update_ui("Merging massive datasets...", 60)
-    merged = pd.merge(
-        df_a.rename(columns={val_col: "_val_A"}),
-        df_b.rename(columns={val_col: "_val_B"}),
-        on="__key__", how="outer", suffixes=("_A", "_B"),
-    )
-
-    update_ui("Calculating SLA differences...", 75)
-    merged["_val_A"] = pd.to_numeric(merged["_val_A"], errors="coerce")
-    merged["_val_B"] = pd.to_numeric(merged["_val_B"], errors="coerce")
-    merged["Δ Change"] = merged["_val_B"] - merged["_val_A"]
-
-    deg_cond = merged["_val_B"] > merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] < merged["_val_A"]
-    imp_cond = merged["_val_B"] < merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] > merged["_val_A"]
+    update_ui("Preparing memory chunks...", 15)
+    all_keys = pd.unique(pd.concat([df_a["__key__"], df_b["__key__"]]))
     
-    merged["Status"] = np.select(
-        [merged["_val_A"].isna() & merged["_val_B"].notna(), merged["_val_A"].notna() & merged["_val_B"].isna(), deg_cond, imp_cond],
-        ["New", "Removed", "Degraded", "Improved"], default="Same"
-    )
+    CHUNK_SIZE = 50000 
+    num_chunks = max(1, len(all_keys) // CHUNK_SIZE + (1 if len(all_keys) % CHUNK_SIZE != 0 else 0))
+    
+    processed_chunks = []
+    is_strict = "1-to-1" in comp_mode
+    dedup_a, dedup_b = True, True
+    if not is_strict:
+        if "File B" in granular_file: dedup_b = False
+        else: dedup_a = False
 
-    update_ui("Coalescing dynamic contextual columns...", 90)
-    for c in [c for c in common_cols if c not in ["__key__", val_col]]:
-        col_a, col_b = f"{c}_A", f"{c}_B"
-        if col_a in merged.columns and col_b in merged.columns:
-            merged[c] = merged[col_b].combine_first(merged[col_a]) # Prioritize B
-            merged.drop(columns=[col_a, col_b], inplace=True)
-        elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
-        elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
+    for i in range(num_chunks):
+        chunk_pct = 15 + int(75 * (i / num_chunks))
+        update_ui(f"Processing chunk {i+1} of {num_chunks} ({(i*CHUNK_SIZE):,} to {min((i+1)*CHUNK_SIZE, len(all_keys)):,} identifiers)...", chunk_pct)
+        
+        chunk_keys = all_keys[i*CHUNK_SIZE : (i+1)*CHUNK_SIZE]
+        
+        sub_a = df_a[df_a["__key__"].isin(chunk_keys)].copy()
+        sub_b = df_b[df_b["__key__"].isin(chunk_keys)].copy()
+        
+        if dedup_a: sub_a = sub_a.drop_duplicates("__key__")
+        if dedup_b: sub_b = sub_b.drop_duplicates("__key__")
+        
+        merged = pd.merge(
+            sub_a.rename(columns={val_col: "_val_A"}),
+            sub_b.rename(columns={val_col: "_val_B"}),
+            on="__key__", how="outer", suffixes=("_A", "_B")
+        )
+        
+        merged["_val_A"] = pd.to_numeric(merged["_val_A"], errors="coerce")
+        merged["_val_B"] = pd.to_numeric(merged["_val_B"], errors="coerce")
+        merged["Δ Change"] = merged["_val_B"] - merged["_val_A"]
 
-    update_ui("Finalizing grouping and formatting...", 95)
-    merged["Group"] = merged[grp_col] if grp_col and grp_col in merged.columns else "All"
+        deg_cond = merged["_val_B"] > merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] < merged["_val_A"]
+        imp_cond = merged["_val_B"] < merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] > merged["_val_A"]
+        
+        merged["Status"] = np.select(
+            [merged["_val_A"].isna() & merged["_val_B"].notna(), merged["_val_A"].notna() & merged["_val_B"].isna(), deg_cond, imp_cond],
+            ["New", "Removed", "Degraded", "Improved"], default="Same"
+        )
+
+        for c in [c for c in common_cols if c not in ["__key__", val_col]]:
+            col_a, col_b = f"{c}_A", f"{c}_B"
+            if col_a in merged.columns and col_b in merged.columns:
+                if not is_strict and "File B" in granular_file:
+                    merged[c] = merged[col_b].combine_first(merged[col_a])
+                elif not is_strict:
+                    merged[c] = merged[col_a].combine_first(merged[col_b])
+                else:
+                    merged[c] = merged[col_b].combine_first(merged[col_a])
+                merged.drop(columns=[col_a, col_b], inplace=True)
+            elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
+            elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
+
+        processed_chunks.append(merged)
+        
+        del sub_a, sub_b, merged
+        gc.collect()
+
+    update_ui("Assembling final dataset...", 95)
+    final_merged = pd.concat(processed_chunks, ignore_index=True)
+    
+    final_merged["Group"] = final_merged[grp_col] if grp_col and grp_col in final_merged.columns else "All"
     
     key_display = " › ".join(key_cols)
-    merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
+    final_merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
 
     base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
     all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in ["__key__", val_col]]
-    context_cols = list(dict.fromkeys([c for c in all_context if c in merged.columns]))
+    context_cols = list(dict.fromkeys([c for c in all_context if c in final_merged.columns]))
     
+    if not is_strict:
+        final_merged = final_merged.drop_duplicates()
+        
     update_ui("Analysis Complete! 🚀", 100)
-    return merged[[c for c in base_cols + context_cols if c in merged.columns]]
-
-# ── Function 2: 1-to-Many Broadcasting Comparison ─────────────────────────────
-def compare_1_to_many(df_a, df_b, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text=None, progress_bar=None) -> pd.DataFrame:
-    def update_ui(msg, pct):
-        if status_text: status_text.markdown(f"**⏳ {msg}**")
-        if progress_bar: progress_bar.progress(pct)
-
-    df_a, df_b = df_a.copy(), df_b.copy()
-
-    update_ui("Aligning columns and padding missing data...", 10)
-    df_b.rename(columns={v: k for k, v in col_map.items()}, inplace=True)
-    
-    for k in key_cols:
-        if k not in df_a.columns: df_a[k] = "MISSING_IN_A"
-        if k not in df_b.columns: df_b[k] = "MISSING_IN_B"
-
-    cols_a_all, cols_b_all = list(df_a.columns), list(df_b.columns)
-    common_cols = [c for c in cols_a_all if c in cols_b_all]
-    only_a = [c for c in cols_a_all if c not in cols_b_all]
-    only_b = [c for c in cols_b_all if c not in cols_a_all]
-
-    update_ui("Generating composite keys...", 25)
-    df_a["__key__"] = make_key(df_a, key_cols)
-    df_b["__key__"] = make_key(df_b, key_cols)
-
-    update_ui(f"Preparing 1-to-Many mapping. Retaining granular rows in {granular_file}...", 40)
-    if granular_file == "File B (Current/New)":
-        df_a = df_a.drop_duplicates("__key__")
-    else:
-        df_b = df_b.drop_duplicates("__key__")
-
-    update_ui("Merging massive datasets (1-to-Many dynamic mapping)...", 60)
-    merged = pd.merge(
-        df_a.rename(columns={val_col: "_val_A"}),
-        df_b.rename(columns={val_col: "_val_B"}),
-        on="__key__", how="outer", suffixes=("_A", "_B"),
-    )
-
-    update_ui("Calculating SLA differences...", 75)
-    merged["_val_A"] = pd.to_numeric(merged["_val_A"], errors="coerce")
-    merged["_val_B"] = pd.to_numeric(merged["_val_B"], errors="coerce")
-    merged["Δ Change"] = merged["_val_B"] - merged["_val_A"]
-
-    deg_cond = merged["_val_B"] > merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] < merged["_val_A"]
-    imp_cond = merged["_val_B"] < merged["_val_A"] if higher_is == "higher_is_worse" else merged["_val_B"] > merged["_val_A"]
-    
-    merged["Status"] = np.select(
-        [merged["_val_A"].isna() & merged["_val_B"].notna(), merged["_val_A"].notna() & merged["_val_B"].isna(), deg_cond, imp_cond],
-        ["New", "Removed", "Degraded", "Improved"], default="Same"
-    )
-
-    update_ui("Coalescing dynamic contextual columns...", 90)
-    for c in [c for c in common_cols if c not in ["__key__", val_col]]:
-        col_a, col_b = f"{c}_A", f"{c}_B"
-        if col_a in merged.columns and col_b in merged.columns:
-            if granular_file == "File B (Current/New)":
-                merged[c] = merged[col_b].combine_first(merged[col_a])
-            else:
-                merged[c] = merged[col_a].combine_first(merged[col_b])
-            merged.drop(columns=[col_a, col_b], inplace=True)
-        elif col_a in merged.columns: merged.rename(columns={col_a: c}, inplace=True)
-        elif col_b in merged.columns: merged.rename(columns={col_b: c}, inplace=True)
-
-    update_ui("Finalizing grouping and formatting...", 95)
-    merged["Group"] = merged[grp_col] if grp_col and grp_col in merged.columns else "All"
-    
-    key_display = " › ".join(key_cols)
-    merged.rename(columns={"__key__": key_display, "_val_A": f"{val_col} (File A)", "_val_B": f"{val_col} (File B)"}, inplace=True)
-
-    base_cols = [key_display, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-    all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in ["__key__", val_col]]
-    context_cols = list(dict.fromkeys([c for c in all_context if c in merged.columns]))
-    
-    merged = merged.drop_duplicates()
-    
-    update_ui("Analysis Complete! 🚀", 100)
-    return merged[[c for c in base_cols + context_cols if c in merged.columns]]
+    return final_merged[[c for c in base_cols + context_cols if c in final_merged.columns]]
 
 # ── Styler & Excel Builders ───────────────────────────────────────────────────
 def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -280,7 +237,8 @@ def style_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
 
 def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+    # constant_memory=True prevents RAM exhaustion when writing massive Excel files
+    with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={'options': {'constant_memory': True}}) as writer:
         wb = writer.book
         fmt = {s: wb.add_format({"bg_color": STATUS_META[s]["bg"], "font_size": 11}) for s in STATUS_META}
         hdr_fmt = wb.add_format({"bold": True, "bg_color": "#1e293b", "font_color": "#ffffff", "font_size": 11})
@@ -313,15 +271,18 @@ def build_excel(results: pd.DataFrame, val_col: str) -> bytes:
             })
         pd.DataFrame(summary_data).to_excel(writer, sheet_name="Summary", index=False)
         write_sheet(results, "All Results")
+        
+        # Write individual group sheets, protecting against empty sheets
         for grp, gdf in results.groupby("Group", sort=True):
-            if grp != "All": write_sheet(gdf, str(grp))
+            if grp != "All" and len(gdf) > 0: write_sheet(gdf, str(grp))
+            
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
 st.title("📊 SLA Comparator")
-st.caption("Compare massive CSV/Excel datasets seamlessly · Optimized for speed")
+st.caption("Compare massive CSV/Excel datasets seamlessly · Chunk Processing Engine Enabled")
 
 # ── Step 1: Upload ─────────────────────────────────────────────────────────────
 with st.container(border=True):
@@ -355,7 +316,6 @@ if not common:
 with st.container(border=True):
     st.markdown("#### 2. Configure Comparison")
     
-    # ── Comparison Mode Selector ──
     mode_c1, mode_c2 = st.columns(2)
     comp_mode = mode_c1.radio("⚙️ Match Architecture", ["Strict 1-to-1 (Deduplicate Both)", "1-to-Many (Broadcast granular rows)"], index=0, on_change=reset_computation)
     
@@ -398,10 +358,7 @@ if run:
     df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
     df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
 
-    if "1-to-1" in comp_mode:
-        results = compare_strict_1_to_1(df_a_full, df_b_full, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
-    else:
-        results = compare_1_to_many(df_a_full, df_b_full, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+    results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
     st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
     
@@ -448,7 +405,31 @@ with tab_data:
 with tab_export:
     st.markdown("#### Download your insights")
     ec1, ec2 = st.columns(2)
+    
     with ec1:
-        st.download_button("⬇️ Download Filtered View (CSV)", data=view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode(), file_name=f"SLA_filtered_{val_col}.csv", mime="text/csv", width="stretch")
+        st.download_button(
+            "⬇️ Download Filtered View (CSV)", 
+            data=view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode(), 
+            file_name=f"SLA_filtered_{val_col}.csv", 
+            mime="text/csv", 
+            width="stretch"
+        )
+        
     with ec2:
-        st.download_button("⬇️ Download Full Multi-Sheet Report (Excel)", data=build_excel(results, val_col), file_name=f"SLA_Full_Report_{val_col}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", type="primary")
+        if "excel_data" not in st.session_state:
+            if st.button("⚙️ Generate Excel Report (Takes Time)", width="stretch", type="primary"):
+                with st.spinner("Building massive Excel file... Please wait (this may take a minute)."):
+                    st.session_state["excel_data"] = build_excel(results, val_col)
+                st.rerun() 
+        else:
+            st.download_button(
+                "⬇️ Download Full Multi-Sheet Report (Excel)", 
+                data=st.session_state["excel_data"], 
+                file_name=f"SLA_Full_Report_{val_col}.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+                width="stretch", 
+                type="primary"
+            )
+            if st.button("🗑️ Clear Excel from memory", width="stretch"):
+                del st.session_state["excel_data"]
+                st.rerun()
