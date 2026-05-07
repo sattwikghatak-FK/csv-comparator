@@ -303,7 +303,7 @@ with st.container(border=True):
         val_options = [c for c in numeric_cols if c not in key_cols] or [c for c in common if c not in key_cols]
         val_col = st.selectbox("📐 Metric to Compare", options=val_options, on_change=reset_computation)
     with cfg3:
-        grp_options = ["(none)"] + [c for c in common if c not in key_cols and c != val_col]
+        grp_options = ["(none)"] + [c for c in common if c != val_col]
         grp_sel = st.selectbox("🗂 Group By (Optional)", options=grp_options, on_change=reset_computation)
         grp_col = None if grp_sel == "(none)" else grp_sel
 
