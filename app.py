@@ -96,6 +96,7 @@ def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
     vals = df[col].dropna().head(sample)
     if vals.empty: return False
     return pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6
+
 def infer_direction(val_col: str) -> str:
     name = normalise_col_name(val_col)
     positive_keywords = ["score", "rating", "accuracy", "fill", "efficiency",
@@ -104,8 +105,6 @@ def infer_direction(val_col: str) -> str:
     for kw in positive_keywords:
         if kw in name: return "higher_is_better"
     return "higher_is_worse"
-
-
 
 def make_key(df, cols):
     if len(cols) == 1: return df[cols[0]].astype(str)
@@ -139,7 +138,6 @@ def compare_strict_1_to_1(df_a, df_b, col_map, key_cols, val_col, grp_col, highe
     df_b["__key__"] = make_key(df_b, key_cols)
 
     update_ui("Deduplicating rows for strict 1-to-1 match...", 40)
-    # STRICT MODE: Deduplicate BOTH files
     df_a = df_a.drop_duplicates("__key__")
     df_b = df_b.drop_duplicates("__key__")
 
@@ -210,7 +208,6 @@ def compare_1_to_many(df_a, df_b, granular_file, col_map, key_cols, val_col, grp
     df_b["__key__"] = make_key(df_b, key_cols)
 
     update_ui(f"Preparing 1-to-Many mapping. Retaining granular rows in {granular_file}...", 40)
-    # BROADCAST MODE: Deduplicate the secondary file, but KEEP ALL rows in the granular file
     if granular_file == "File B (Current/New)":
         df_a = df_a.drop_duplicates("__key__")
     else:
@@ -240,7 +237,6 @@ def compare_1_to_many(df_a, df_b, granular_file, col_map, key_cols, val_col, grp
     for c in [c for c in common_cols if c not in ["__key__", val_col]]:
         col_a, col_b = f"{c}_A", f"{c}_B"
         if col_a in merged.columns and col_b in merged.columns:
-            # Prioritize the contextual data from the chosen granular file
             if granular_file == "File B (Current/New)":
                 merged[c] = merged[col_b].combine_first(merged[col_a])
             else:
@@ -259,7 +255,7 @@ def compare_1_to_many(df_a, df_b, granular_file, col_map, key_cols, val_col, grp
     all_context = [c for c in (common_cols + only_a + only_b) if c not in base_cols and c not in ["__key__", val_col]]
     context_cols = list(dict.fromkeys([c for c in all_context if c in merged.columns]))
     
-    merged = merged.drop_duplicates() # Final cleanup of exact duplicate cartesian clones
+    merged = merged.drop_duplicates()
     
     update_ui("Analysis Complete! 🚀", 100)
     return merged[[c for c in base_cols + context_cols if c in merged.columns]]
@@ -385,14 +381,13 @@ with st.container(border=True):
         horizontal=True, on_change=reset_computation
     )
 
-    run = st.button("🚀 Run Full Analysis", type="primary", use_container_width=True, disabled=not (key_cols and val_col))
+    run = st.button("🚀 Run Full Analysis", type="primary", width="stretch", disabled=not (key_cols and val_col))
 
 if not run and "results" not in st.session_state:
     st.stop()
 
 # ── Step 3: Compute ────────────────────────────────────────────────────────────
 if run:
-    # Set up UI elements for the Progress Tracker
     st.markdown("---")
     status_text = st.empty()
     progress_bar = st.progress(0)
@@ -403,7 +398,6 @@ if run:
     df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
     df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
 
-    # Trigger the correct function based on user's architecture choice
     if "1-to-1" in comp_mode:
         results = compare_strict_1_to_1(df_a_full, df_b_full, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
     else:
@@ -411,7 +405,6 @@ if run:
         
     st.session_state.update({"results": results, "key_cols": key_cols, "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
     
-    # Clear progress bar when finished
     status_text.empty()
     progress_bar.empty()
 
@@ -448,7 +441,7 @@ with tab_data:
         
         with st.expander(f"{grp_label} ({len(grp_df):,} rows)  |  {badges}", expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
             show = grp_df.drop(columns=["Group"], errors="ignore")
-            st.dataframe(style_table(show.head(1500)), use_container_width=True, height=min(500, 45 + len(show) * 36))
+            st.dataframe(style_table(show.head(1500)), width="stretch", height=min(500, 45 + len(show) * 36))
             if len(show) > 1500:
                 st.warning(f"⚠️ Showing first 1,500 rows for UI performance. Please export to view all {len(show):,} rows.")
 
@@ -456,6 +449,6 @@ with tab_export:
     st.markdown("#### Download your insights")
     ec1, ec2 = st.columns(2)
     with ec1:
-        st.download_button("⬇️ Download Filtered View (CSV)", data=view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode(), file_name=f"SLA_filtered_{val_col}.csv", mime="text/csv", use_container_width=True)
+        st.download_button("⬇️ Download Filtered View (CSV)", data=view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode(), file_name=f"SLA_filtered_{val_col}.csv", mime="text/csv", width="stretch")
     with ec2:
-        st.download_button("⬇️ Download Full Multi-Sheet Report (Excel)", data=build_excel(results, val_col), file_name=f"SLA_Full_Report_{val_col}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True, type="primary")
+        st.download_button("⬇️ Download Full Multi-Sheet Report (Excel)", data=build_excel(results, val_col), file_name=f"SLA_Full_Report_{val_col}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", type="primary")
