@@ -77,25 +77,24 @@ def match_columns(cols_a: list, cols_b: list) -> dict:
             mapping[ca] = nb
     return mapping   
 
-def get_sheet_names(file) -> list:
-    file.seek(0)
-    xls = pd.ExcelFile(file)
+@st.cache_data(show_spinner=False)
+def get_sheet_names(file_bytes: bytes) -> list:
+    xls = pd.ExcelFile(BytesIO(file_bytes))
     return xls.sheet_names
 
-def get_preview_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    file.seek(0)
+@st.cache_data(show_spinner=False)
+def get_preview_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False, nrows=2000)
     else:
-        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
+        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace", nrows=2000)
     return clean_df(df)
 
-def load_data(file, file_name: str, sheet_name: str = None) -> pd.DataFrame:
-    file.seek(0)
+def load_data(file_bytes: bytes, file_name: str, sheet_name: str = None) -> pd.DataFrame:
     if file_name.lower().endswith('.xlsx'):
-        df = pd.read_excel(file, sheet_name=sheet_name, dtype=str, keep_default_na=False)
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, keep_default_na=False)
     else:
-        df = pd.read_csv(file, dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
+        df = pd.read_csv(BytesIO(file_bytes), dtype=str, keep_default_na=False, skipinitialspace=True, encoding_errors="replace")
     return clean_df(df)
 
 def sniff_numeric(df: pd.DataFrame, col: str, sample: int = 1000) -> bool:
@@ -261,19 +260,19 @@ with st.container(border=True):
     with c1:
         st.markdown("**📁 File A — Baseline / Previous**")
         up_a = st.file_uploader("File A", type=["csv", "xlsx"], key="fa", label_visibility="collapsed", on_change=reset_computation)
-        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
+        sheet_a = st.selectbox("📝 Select Sheet (File A)", get_sheet_names(up_a.getvalue()), on_change=reset_computation) if up_a and up_a.name.lower().endswith(".xlsx") else None
     with c2:
         st.markdown("**📁 File B — Current / New**")
         up_b = st.file_uploader("File B", type=["csv", "xlsx"], key="fb", label_visibility="collapsed", on_change=reset_computation)
-        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
+        sheet_b = st.selectbox("📝 Select Sheet (File B)", get_sheet_names(up_b.getvalue()), on_change=reset_computation) if up_b and up_b.name.lower().endswith(".xlsx") else None
 
 if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
 with st.spinner("Extracting headers and detecting data types..."):
-    df_a_preview = get_preview_data(up_a, up_a.name, sheet_a)
-    df_b_preview = get_preview_data(up_b, up_b.name, sheet_b)
+    df_a_preview = get_preview_data(up_a.getvalue(), up_a.name, sheet_a)
+    df_b_preview = get_preview_data(up_b.getvalue(), up_b.name, sheet_b)
 
 col_map = match_columns(list(df_a_preview.columns), list(df_b_preview.columns))
 common = list(col_map.keys())
@@ -324,11 +323,11 @@ if run:
     
     status_text.markdown(f"**⏳ Reading {up_a.name} into memory... (Excel files may take a minute)**")
     progress_bar.progress(10)
-    df_a_full = load_data(up_a, up_a.name, sheet_a)
+    df_a_full = load_data(up_a.getvalue(), up_a.name, sheet_a)
     
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory... (Almost there)**")
     progress_bar.progress(35)
-    df_b_full = load_data(up_b, up_b.name, sheet_b)
+    df_b_full = load_data(up_b.getvalue(), up_b.name, sheet_b)
 
     results = process_comparison_chunked(df_a_full, df_b_full, comp_mode, granular_file, col_map, key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
         
@@ -347,7 +346,7 @@ for i, s in enumerate(STATUS_ORDER):
     cols_m[i+1].metric(f"{STATUS_META[s]['icon']} {s}", f"{sc.get(s, 0):,}")
 
 st.markdown("")
-tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 Export Data"])
+tab_data, tab_export = st.tabs(["📋 Detailed Data Viewer", "💾 CSV Export"])
 
 with tab_data:
     fc1, fc2, fc3 = st.columns([2, 2, 1])
@@ -377,7 +376,7 @@ with tab_data:
 
 with tab_export:
     st.markdown("#### Download CSV Report")
-    st.caption("Downloads the current filtered view as a simple CSV file.")
+    st.caption("Downloads the current filtered view as a fast, lightweight CSV file.")
     
     if "csv_data" not in st.session_state:
         if st.button("⚙️ Generate CSV File", width="stretch", type="primary"):
