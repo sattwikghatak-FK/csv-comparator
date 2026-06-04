@@ -208,8 +208,26 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
             final[c] = final[c].astype(str).str.strip().str.title()
             final[c] = final[c].replace("Nan", np.nan)
 
-    final["Group"] = (final[grp_col].astype(str).str.strip().str.title().fillna("Unknown")
-                      if grp_col and grp_col in final.columns else "All")
+    # Resolve the group column — common columns get renamed to "(File A)"/"(File B)"
+    # by the rename block above, so the plain name no longer exists.
+    # Coalesce A then B so New rows (only in B) and Removed rows (only in A) are covered.
+    if grp_col:
+        grp_a = f"{grp_col} (File A)"
+        grp_b = f"{grp_col} (File B)"
+        if grp_col in final.columns:
+            grp_series = final[grp_col]
+        elif grp_a in final.columns:
+            grp_series = final[grp_a].combine_first(
+                final[grp_b] if grp_b in final.columns else pd.Series(dtype=str))
+        elif grp_b in final.columns:
+            grp_series = final[grp_b]
+        else:
+            grp_series = None
+
+        final["Group"] = (grp_series.astype(str).str.strip().str.title().fillna("Unknown")
+                          if grp_series is not None else "All")
+    else:
+        final["Group"] = "All"
 
     kd = "-".join(key_cols)
     final.rename(columns={"__key__": kd,
