@@ -4,6 +4,7 @@ import numpy as np
 from io import BytesIO
 import gc
 
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Air SLA Comparator", page_icon="✈️", layout="wide")
 
 st.markdown("""
@@ -27,7 +28,7 @@ STATUS_META = {
 STATUS_ORDER = ["Degraded", "Improved", "Same", "New", "Removed"]
 
 def reset_computation():
-    for key in ["results", "key_cols", "val_col", "grp_col", "higher_is"]:
+    for key in ["results", "key_cols", "val_col", "grp_col"]:
         st.session_state.pop(key, None)
 
 # ── File bytes cache (no re-hash on reruns) ───────────────────────────────────
@@ -105,16 +106,7 @@ def match_columns(cols_a, cols_b) -> dict:
     return {ca: norm_b[str(ca).strip().lower()]
             for ca in cols_a if str(ca).strip().lower() in norm_b}
 
-def infer_direction(val_col: str) -> str:
-    name = val_col.strip().lower()
-    for kw in ["score","rating","accuracy","fill","efficiency","utilisation",
-               "utilization","revenue","profit","coverage","success","satisfaction","nps"]:
-        if kw in name: return "higher_is_better"
-    return "higher_is_worse"
-
 # ── KEY FIX: normalise values to UPPERCASE + strip before joining ─────────────
-# Root cause of 0 matches: June had "MUMBAI", May had "Mumbai".
-# Raw string concat → "MUMBAI-110001" ≠ "Mumbai-110001" → zero overlap.
 def make_key(df, cols):
     res = df[cols[0]].astype(str).str.strip().str.upper()
     for c in cols[1:]:
@@ -122,8 +114,7 @@ def make_key(df, cols):
     return res
 
 # ── Chunk processing engine ───────────────────────────────────────────────────
-def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
-                                key_cols, val_col, grp_col, higher_is,
+def process_comparison_chunked(df_a, df_b, col_map, key_cols, val_col, grp_col,
                                 status_text=None, progress_bar=None) -> pd.DataFrame:
     def ui(msg, pct):
         if status_text:  status_text.markdown(f"**⏳ {msg}**")
@@ -150,12 +141,6 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     CHUNK = 50_000
     num_chunks = max(1, -(-len(all_keys) // CHUNK))
 
-    is_strict = "1-to-1" in comp_mode
-    dedup_a = dedup_b = True
-    if not is_strict:
-        if granular_file and "File B" in granular_file: dedup_b = False
-        else: dedup_a = False
-
     chunks = []
     for i in range(num_chunks):
         ui(f"Chunk {i+1}/{num_chunks} ({i*CHUNK:,}–{min((i+1)*CHUNK, len(all_keys)):,} keys)...",
@@ -163,8 +148,9 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
         ck = all_keys[i*CHUNK:(i+1)*CHUNK]
         sa = df_a[df_a["__key__"].isin(ck)].copy()
         sb = df_b[df_b["__key__"].isin(ck)].copy()
-        if dedup_a: sa = sa.drop_duplicates("__key__")
-        if dedup_b: sb = sb.drop_duplicates("__key__")
+        
+        # Default 1-to-Many Architecture: Broadcast granular rows from File B
+        sa = sa.drop_duplicates("__key__") 
 
         m = pd.merge(sa.rename(columns={val_col: "_val_A"}),
                      sb.rename(columns={val_col: "_val_B"}),
@@ -173,17 +159,15 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
         m["_val_B"] = pd.to_numeric(m["_val_B"], errors="coerce")
         m["Δ Change"] = m["_val_B"] - m["_val_A"]
 
-        deg = m["_val_B"] > m["_val_A"] if higher_is == "higher_is_worse" else m["_val_B"] < m["_val_A"]
-        imp = m["_val_B"] < m["_val_A"] if higher_is == "higher_is_worse" else m["_val_B"] > m["_val_A"]
+        # Default Value Direction: Higher is Worse
+        deg = m["_val_B"] > m["_val_A"] 
+        imp = m["_val_B"] < m["_val_A"] 
+        
         m["Status"] = np.select(
             [m["_val_A"].isna() & m["_val_B"].notna(),
              m["_val_A"].notna() & m["_val_B"].isna(), deg, imp],
             ["New","Removed","Degraded","Improved"], default="Same")
 
-        # Keep ALL columns from both files side-by-side for reference.
-        # Common cols → "{col} (File A)" and "{col} (File B)" (both retained).
-        # Only-A cols → "{col} (File A)".
-        # Only-B cols → "{col} (File B)".
         rename_map = {}
         for c in [c for c in common_cols if c not in ["__key__", val_col]]:
             ca, cb = f"{c}_A", f"{c}_B"
@@ -201,16 +185,12 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     ui("Assembling final dataset...", 95)
     final = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
-    # Normalise string columns to title-case so BANGALORE/Bangalore unify.
     skip_norm = {"__key__", "_val_A", "_val_B", "Status"}
     for c in final.select_dtypes(include=["object", "string"]).columns:
         if c not in skip_norm:
             final[c] = final[c].astype(str).str.strip().str.title()
             final[c] = final[c].replace("Nan", np.nan)
 
-    # Resolve the group column — common columns get renamed to "(File A)"/"(File B)"
-    # by the rename block above, so the plain name no longer exists.
-    # Coalesce A then B so New rows (only in B) and Removed rows (only in A) are covered.
     if grp_col:
         grp_a = f"{grp_col} (File A)"
         grp_b = f"{grp_col} (File B)"
@@ -234,10 +214,6 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
                            "_val_A": f"{val_col} (File A)",
                            "_val_B": f"{val_col} (File B)"}, inplace=True)
 
-    # Build ordered column list:
-    # [key | val A | val B | Δ | Status | Group]
-    # then common cols interleaved as (File A)/(File B) pairs
-    # then only-A cols, then only-B cols
     base = [kd, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
     paired = []
     for c in common_cols:
@@ -249,7 +225,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     solo_b = [f"{c} (File B)" for c in only_b if f"{c} (File B)" in final.columns]
     ctx = list(dict.fromkeys(paired + solo_a + solo_b))
 
-    if not is_strict: final = final.drop_duplicates()
+    final = final.drop_duplicates()
     ui("Analysis Complete! 🚀", 100)
     return final[[c for c in base + ctx if c in final.columns]]
 
@@ -273,23 +249,10 @@ def style_table(df: pd.DataFrame):
 
 # ── Output column selector ────────────────────────────────────────────────────
 def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
-    """
-    Keep only the reference columns the user cares about.
-    All pattern matching is case-insensitive so Pincode/pincode/PINCODE all resolve.
-
-    Columns retained (in order):
-        Source City | Pincode | SLA A | SLA B | Δ | Status
-        | Total SLA Hrs A | Total SLA Hrs B
-        | MH Name A | MH Name B
-        | S2H (coalesced) | PH Name (coalesced) | DH Name (coalesced)
-        | Dest City (best available)
-        | Group
-    """
     kd   = "-".join(key_cols)
     SKIP = {kd, "Status", "Δ Change", "Group",
             f"{val_col} (File A)", f"{val_col} (File B)"}
 
-    # ── helpers — all comparisons are .lower() so column case never matters ──
     def _find_a(patterns):
         for pat in patterns:
             c = next((c for c in df.columns
@@ -311,7 +274,6 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
              and c not in SKIP), None)
 
     def _coalesce(patterns):
-        """A where available, B as fallback — handles New/Removed rows gracefully."""
         ca, cb = _find_a(patterns), _find_b(patterns)
         if ca and cb:  return df[ca].combine_first(df[cb])
         if ca:         return df[ca]
@@ -319,21 +281,14 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
         plain = _find_any(patterns)
         return df[plain] if plain else None
 
-    # ── assemble ──────────────────────────────────────────────────────────────
     out = {}
 
-    # ── Composite key (kept for reference) ────────────────────────────────────
     out[kd] = df[kd]
 
-    # ── Source City — extracted as a standalone column for grouping & filtering
-    # Matches "source city", "Source City", "SOURCE CITY" etc.
     s = _coalesce(["source city", "source_city"])
     if s is not None:
         out["Source City"] = s
 
-    # ── Pincode — standalone
-    # Exact match on the part before "(File A/B)" to avoid
-    # "Pincode_Formatted", "pincode check", etc.
     def _exact_a(name):
         n = name.lower()
         return next((c for c in df.columns
@@ -353,23 +308,19 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
     if pincode_series is not None:
         out["Pincode"] = pincode_series
 
-    # ── SLA days — both files (primary comparison metric) ─────────────────────
     for lbl in [f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status"]:
         if lbl in df.columns: out[lbl] = df[lbl]
 
-    # ── Total SLA Hours — both files ──────────────────────────────────────────
     ca = _find_a(["total_sla_hrs", "total_sla"])
     cb = _find_b(["total_sla_hrs", "total_sla"])
     if ca: out["Total SLA Hrs (File A)"] = df[ca]
     if cb: out["Total SLA Hrs (File B)"] = df[cb]
 
-    # ── MH Name — both files ──────────────────────────────────────────────────
     ca = _find_a(["ekart_mh_name", "mh_name"])
     cb = _find_b(["ekart_mh_name", "mh_name"])
     if ca: out["MH Name (File A)"] = df[ca]
     if cb: out["MH Name (File B)"] = df[cb]
 
-    # ── Single-value reference cols (coalesced A → B) ─────────────────────────
     s = _coalesce(["s2h_in_hr", "s2h"])
     if s is not None: out["S2H (hrs)"] = s
 
@@ -379,7 +330,6 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
     s = _coalesce(["dh_name"])
     if s is not None: out["DH Name"] = s
 
-    # ── Dest City — best available ─────────────────────────────────────────────
     dest = _find_any(["mapped_dest_city", "city_from_mapped_dmh",
                       "city_from_dmh", "dest_city", "dest city"])
     if dest: out["Dest City"] = df[dest]
@@ -450,14 +400,9 @@ with st.container(border=True):
         mc1, mc2, mc3 = st.columns(3)
         cols_for_formula = numeric_cols or common
 
-        # ── FIX: default to total_sla_hrs for SLA col ─────────────────────
         def_sla_idx = next(
             (i for i, c in enumerate(cols_for_formula) if "total_sla" in c.lower()), 0)
 
-        # ── FIX: default to f2f_BUFFER_sla, NOT f2f_del_sla ──────────────
-        # Formula: ceil((total_sla_hrs - f2f_buffer_sla) / 24)
-        # f2f_buffer_sla is the correct deduction column (f2f_del_sla is ~50 hrs
-        # and would wrongly collapse all SLA values to ~0).
         def_f2f_idx = next(
             (i for i, c in enumerate(cols_for_formula) if "f2f_buffer" in c.lower()),
             next(
@@ -488,25 +433,12 @@ with st.container(border=True):
         except Exception:
             pass
     else:
-        # key_cols may not be defined yet at this point — use empty list as fallback
         _existing_key_cols = st.session_state.get("key_cols", [])
         val_opts = ([c for c in numeric_cols if c not in _existing_key_cols]
                     or [c for c in common if c not in _existing_key_cols])
         val_col  = st.selectbox("📐 Metric to Compare", options=val_opts,
                                  on_change=reset_computation)
 
-    st.markdown("---")
-    mode_c1, mode_c2 = st.columns(2)
-    comp_mode = mode_c1.radio("⚙️ Match Architecture",
-                               ["Strict 1-to-1 (Deduplicate Both)",
-                                "1-to-Many (Broadcast granular rows)"],
-                               index=1, on_change=reset_computation)
-    granular_file = None
-    if "1-to-Many" in comp_mode:
-        granular_file = mode_c2.selectbox(
-            "📌 Which file is granular? (keep its duplicates)",
-            ["File B (Current/New)", "File A (Baseline/Previous)"],
-            on_change=reset_computation)
     st.markdown("---")
 
     cfg1, cfg2 = st.columns(2)
@@ -522,14 +454,6 @@ with st.container(border=True):
                                 ["(none)"] + [c for c in common if c != val_col],
                                 on_change=reset_computation)
         grp_col = None if grp_sel == "(none)" else grp_sel
-
-    higher_is = st.radio(
-        "📈 Value direction meaning",
-        ["higher_is_worse", "higher_is_better"],
-        index=0 if infer_direction(val_col) == "higher_is_worse" else 1,
-        format_func=lambda x: "⬆ Higher = Worse (e.g., Days)"
-                               if x == "higher_is_worse" else "⬆ Higher = Better (e.g., Score)",
-        horizontal=True, on_change=reset_computation)
 
     run_disabled = not key_cols or not val_col
     if "Compute" in metric_strat:
@@ -577,15 +501,15 @@ if run:
             df[val_col] = np.ceil((sla - f2f) / 24)
 
     results_full = process_comparison_chunked(
-        df_a_full, df_b_full, comp_mode, granular_file, col_map,
-        key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+        df_a_full, df_b_full, col_map,
+        key_cols, val_col, grp_col, status_text, progress_bar)
 
     # Slim to only the reference columns the user needs
     results = slim_output(results_full, val_col, key_cols)
     del results_full; gc.collect()
 
     st.session_state.update({"results": results, "key_cols": key_cols,
-                              "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
+                              "val_col": val_col, "grp_col": grp_col})
     del df_a_full, df_b_full; gc.collect()
     status_text.empty(); progress_bar.empty()
 
@@ -593,7 +517,6 @@ results   = st.session_state["results"]
 key_cols  = st.session_state["key_cols"]
 val_col   = st.session_state["val_col"]
 grp_col   = st.session_state["grp_col"]
-higher_is = st.session_state["higher_is"]
 
 sc = results["Status"].value_counts()
 cols_m = st.columns(6)
