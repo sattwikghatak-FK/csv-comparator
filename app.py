@@ -195,7 +195,17 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
 
     ui("Assembling final dataset...", 95)
     final = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-    final["Group"] = (final[grp_col].fillna("Unknown")
+
+    # Normalise every string context column to title-case so values that
+    # differ only in capitalisation (e.g. "BANGALORE" vs "Bangalore") are
+    # unified — this is the same case-mismatch root cause as the key fix,
+    # but manifesting in display/grouping columns after the outer merge.
+    for c in final.select_dtypes(include=["object", "string"]).columns:
+        if c not in ["__key__", "_val_A", "_val_B", "Status"]:
+            final[c] = final[c].astype(str).str.strip().str.title()
+            final[c] = final[c].replace("Nan", np.nan)
+
+    final["Group"] = (final[grp_col].astype(str).str.strip().str.title().fillna("Unknown")
                       if grp_col and grp_col in final.columns else "All")
 
     kd = "-".join(key_cols)
