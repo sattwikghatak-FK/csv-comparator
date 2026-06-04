@@ -275,9 +275,10 @@ def style_table(df: pd.DataFrame):
 def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
     """
     Keep only the reference columns the user cares about.
+    All pattern matching is case-insensitive so Pincode/pincode/PINCODE all resolve.
 
     Columns retained (in order):
-        key | SLA A | SLA B | Δ | Status
+        Source City | Pincode | SLA A | SLA B | Δ | Status
         | Total SLA Hrs A | Total SLA Hrs B
         | MH Name A | MH Name B
         | S2H (coalesced) | PH Name (coalesced) | DH Name (coalesced)
@@ -288,7 +289,7 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
     SKIP = {kd, "Status", "Δ Change", "Group",
             f"{val_col} (File A)", f"{val_col} (File B)"}
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    # ── helpers — all comparisons are .lower() so column case never matters ──
     def _find_a(patterns):
         for pat in patterns:
             c = next((c for c in df.columns
@@ -304,14 +305,13 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
         return None
 
     def _find_any(patterns):
-        """File A preferred, then File B, then plain (for only-one-side cols)."""
         return _find_a(patterns) or _find_b(patterns) or next(
             (c for c in df.columns
              if any(p.lower() in c.lower() for p in patterns)
              and c not in SKIP), None)
 
     def _coalesce(patterns):
-        """Merge A and B: A where available, otherwise B (handles New/Removed rows)."""
+        """A where available, B as fallback — handles New/Removed rows gracefully."""
         ca, cb = _find_a(patterns), _find_b(patterns)
         if ca and cb:  return df[ca].combine_first(df[cb])
         if ca:         return df[ca]
@@ -322,37 +322,64 @@ def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
     # ── assemble ──────────────────────────────────────────────────────────────
     out = {}
 
+    # ── Composite key (kept for reference) ────────────────────────────────────
     out[kd] = df[kd]
 
-    # SLA days — both files (the primary comparison metric)
+    # ── Source City — extracted as a standalone column for grouping & filtering
+    # Matches "source city", "Source City", "SOURCE CITY" etc.
+    s = _coalesce(["source city", "source_city"])
+    if s is not None:
+        out["Source City"] = s
+
+    # ── Pincode — standalone
+    # Exact match on the part before "(File A/B)" to avoid
+    # "Pincode_Formatted", "pincode check", etc.
+    def _exact_a(name):
+        n = name.lower()
+        return next((c for c in df.columns
+                     if c.lower().split("(file")[0].strip().rstrip("_") == n
+                     and "(file a)" in c.lower()), None)
+
+    def _exact_b(name):
+        n = name.lower()
+        return next((c for c in df.columns
+                     if c.lower().split("(file")[0].strip().rstrip("_") == n
+                     and "(file b)" in c.lower()), None)
+
+    pc_a, pc_b = _exact_a("pincode"), _exact_b("pincode")
+    pincode_series = (df[pc_a].combine_first(df[pc_b]) if pc_a and pc_b
+                      else df[pc_a] if pc_a
+                      else df[pc_b] if pc_b else None)
+    if pincode_series is not None:
+        out["Pincode"] = pincode_series
+
+    # ── SLA days — both files (primary comparison metric) ─────────────────────
     for lbl in [f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status"]:
         if lbl in df.columns: out[lbl] = df[lbl]
 
-    # Total SLA Hours — keep both so you can see what changed upstream
+    # ── Total SLA Hours — both files ──────────────────────────────────────────
     ca = _find_a(["total_sla_hrs", "total_sla"])
     cb = _find_b(["total_sla_hrs", "total_sla"])
     if ca: out["Total SLA Hrs (File A)"] = df[ca]
     if cb: out["Total SLA Hrs (File B)"] = df[cb]
 
-    # MH Name — keep both (may differ for New/Removed rows)
+    # ── MH Name — both files ──────────────────────────────────────────────────
     ca = _find_a(["ekart_mh_name", "mh_name"])
     cb = _find_b(["ekart_mh_name", "mh_name"])
     if ca: out["MH Name (File A)"] = df[ca]
     if cb: out["MH Name (File B)"] = df[cb]
 
-    # S2H — coalesce (usually identical, but NaN on one side for New/Removed)
+    # ── Single-value reference cols (coalesced A → B) ─────────────────────────
     s = _coalesce(["s2h_in_hr", "s2h"])
     if s is not None: out["S2H (hrs)"] = s
 
-    # PH Name — coalesce
     s = _coalesce(["ph_name"])
     if s is not None: out["PH Name"] = s
 
-    # DH Name — coalesce
     s = _coalesce(["dh_name"])
     if s is not None: out["DH Name"] = s
 
-    # Dest City — priority order: mapped_dest_city → city_from_mapped_dmh → city_from_dmh
+    # ── Dest City — best available ─────────────────────────────────────────────
     dest = _find_any(["mapped_dest_city", "city_from_mapped_dmh",
                       "city_from_dmh", "dest_city", "dest city"])
     if dest: out["Dest City"] = df[dest]
@@ -598,11 +625,14 @@ def results_viewer():
         st.caption(f"Showing **{len(view):,}** of **{len(results):,}** rows · "
                    f"**{view['Group'].nunique()}** group(s)")
 
-        for grp_name, grp_df in view.groupby("Group", sort=True, dropna=False):
+        # Group by Source City column if it exists, otherwise fall back to Group
+        grp_field = "Source City" if "Source City" in view.columns else "Group"
+        for grp_name, grp_df in view.groupby(grp_field, sort=True, dropna=False):
             gc_c   = grp_df["Status"].value_counts()
             badges = "  ".join(f"{STATUS_META[s]['icon']} {s}: {gc_c.get(s,0)}"
                                 for s in STATUS_ORDER if gc_c.get(s, 0) > 0)
-            label  = "Overall Dataset" if grp_name == "All" else f"{grp_col}: {grp_name}"
+            label  = ("Overall Dataset" if grp_name in ("All", "Unknown")
+                      else f"Source City: {grp_name}")
             with st.expander(f"{label} ({len(grp_df):,} rows)  |  {badges}",
                              expanded=(grp_name == "All" or view["Group"].nunique() <= 2)):
                 show = grp_df.drop(columns=["Group"], errors="ignore")
