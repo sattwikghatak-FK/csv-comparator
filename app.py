@@ -68,7 +68,7 @@ def _cached_sniff(file_name: str, file_size: int, sheet_name,
                     pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6)
     return out
 
-# ── Public wrappers (pass bytes as unhashed _param) ───────────────────────────
+# ── Public wrappers ───────────────────────────
 def get_sheet_names(f) -> list:
     if not f: return []
     return _cached_sheet_names(f.name, f.size, get_file_bytes(f, f.name))
@@ -237,25 +237,24 @@ st.caption("Compare massive CSV/Excel datasets seamlessly · Optimized Chunk Pro
 with st.container(border=True):
     st.markdown("#### 1. Upload Datasets")
     
-    # EXPLICIT MANDATORY VS OPTIONAL COLUMNS UI
     st.warning("""
     **🚨 Mandatory Columns:**
-    - **For Identifiers/Keys:** At least one shared tracking column (e.g., `pincode`, `dh_name`).
-    - **For 'Compute Derived SLA':** `total_sla_hrs` **AND** a buffer column (e.g., `f2f_del_sla` or `f2f_buffer_sla`).
+    - **Keys:** `Source City`, `pincode` (or equivalent identifiers).
+    - **Compute Derived SLA:** `total_sla_hrs` **AND** a buffer column (e.g., `f2f_del_sla` or `f2f_buffer_sla`).
 
-    **💡 Optional/Contextual Columns (passed through if present):** `ph_name`, `f2p_sla`, `s2h_in_hr`, `lpht`
+    **💡 Optional/Contextual Columns:** `ph_name`, `dh_name`, `f2p_sla`, `s2h_in_hr`, `lpht`
     """, icon="⚠️")
     
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**📁 File A — Baseline / Previous**")
+        st.markdown("**📁 File A — Baseline / Previous (e.g. May SLA)**")
         up_a = st.file_uploader("File A", type=["csv","xlsx"], key="fa",
                                  label_visibility="collapsed", on_change=reset_computation)
         sheet_a = (st.selectbox("📝 Sheet (File A)", get_sheet_names(up_a),
                                  on_change=reset_computation)
                    if up_a and up_a.name.lower().endswith(".xlsx") else None)
     with c2:
-        st.markdown("**📁 File B — Current / New**")
+        st.markdown("**📁 File B — Current / New (e.g. June SLA)**")
         up_b = st.file_uploader("File B", type=["csv","xlsx"], key="fb",
                                  label_visibility="collapsed", on_change=reset_computation)
         sheet_b = (st.selectbox("📝 Sheet (File B)", get_sheet_names(up_b),
@@ -266,7 +265,6 @@ if not (up_a and up_b):
     st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
-# Instant after first upload — cache key is (name, size, sheet), not bytes
 with st.spinner("Extracting headers and detecting column types..."):
     df_a_prev = get_preview_data(up_a, sheet_a)
     df_b_prev = get_preview_data(up_b, sheet_b)
@@ -285,17 +283,22 @@ numeric_cols = [c for c in common if sniff_a.get(c) or sniff_b.get(col_map.get(c
 with st.container(border=True):
     st.markdown("#### 2. Configure Comparison")
     
-    # Metric Strategy
+    # Pre-select Computed Strategy dynamically if formula columns exist
+    default_strat = 1 if any("total_sla" in c.lower() for c in common) and any("f2f" in c.lower() for c in common) else 0
     metric_strat = st.radio(
         "⚙️ Evaluation Strategy",
         ["Compare an existing column", "Compute Derived SLA (Days): Round((Total SLA Hrs - F2F Hrs) / 24, 0)"],
-        index=0, on_change=reset_computation
+        index=default_strat, on_change=reset_computation
     )
     
     if "Compute" in metric_strat:
         mc1, mc2, mc3 = st.columns(3)
-        sla_hrs_col = mc1.selectbox("⏱️ Select Total SLA Hours Col", options=numeric_cols or common, on_change=reset_computation)
-        f2f_hrs_col = mc2.selectbox("🛑 Select F2F / Buffer Col", options=numeric_cols or common, index=min(1, len(numeric_cols)-1) if len(numeric_cols) > 1 else 0, on_change=reset_computation)
+        # Smart detection for SLA and F2F defaults
+        def_sla_idx = next((i for i, c in enumerate(numeric_cols or common) if "total_sla" in c.lower()), 0)
+        def_f2f_idx = next((i for i, c in enumerate(numeric_cols or common) if "f2f_del" in c.lower() or "f2f_buffer" in c.lower()), min(1, len(numeric_cols)-1) if len(numeric_cols)>1 else 0)
+        
+        sla_hrs_col = mc1.selectbox("⏱️ Select Total SLA Hours Col", options=numeric_cols or common, index=def_sla_idx, on_change=reset_computation)
+        f2f_hrs_col = mc2.selectbox("🛑 Select F2F / Buffer Col", options=numeric_cols or common, index=def_f2f_idx, on_change=reset_computation)
         val_col = mc3.text_input("✏️ Computed Column Name", value="Computed_SLA_Days", on_change=reset_computation)
     else:
         val_opts = ([c for c in numeric_cols if c not in key_cols]
@@ -308,7 +311,7 @@ with st.container(border=True):
     comp_mode = mode_c1.radio("⚙️ Match Architecture",
                                ["Strict 1-to-1 (Deduplicate Both)",
                                 "1-to-Many (Broadcast granular rows)"],
-                               index=0, on_change=reset_computation)
+                               index=1, on_change=reset_computation) # Default to 1-to-Many for this use case
     granular_file = None
     if "1-to-Many" in comp_mode:
         granular_file = mode_c2.selectbox(
@@ -319,8 +322,12 @@ with st.container(border=True):
 
     cfg1, cfg2 = st.columns(2)
     with cfg1:
+        # Smart detection to pre-select 'Source City' and 'pincode' if they exist
+        suggested_keys = [c for c in common if c.lower() in ["source city", "pincode", "source_city"]]
+        default_keys = suggested_keys if suggested_keys else ([common[0]] if common else [])
+        
         key_cols = st.multiselect("🔑 Unique Identifier(s)", options=common,
-                                   default=[common[0]] if common else [],
+                                   default=default_keys,
                                    on_change=reset_computation)
     with cfg2:
         grp_sel = st.selectbox("🗂 Group By (Optional)",
@@ -363,11 +370,15 @@ if run:
 
     status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**"); progress_bar.progress(10)
     df_a_full = load_full_data(up_a, sheet_a)
-    df_a_full = df_a_full[[c for c in essential_cols_a if c in df_a_full.columns]]
+    # Aggressively drop unused columns immediately, but keep pass-through contextual columns
+    contextual_keep_a = [c for c in df_a_full.columns if c in common] 
+    df_a_full = df_a_full[list(set(list(essential_cols_a) + contextual_keep_a))]
 
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**"); progress_bar.progress(35)
     df_b_full = load_full_data(up_b, sheet_b)
-    df_b_full = df_b_full[[c for c in essential_cols_b if c in df_b_full.columns]]
+    # Map back B columns dynamically
+    mapped_b_keep = [col_map.get(c, c) for c in common]
+    df_b_full = df_b_full[list(set(list(essential_cols_b) + mapped_b_keep).intersection(df_b_full.columns))]
     
     # 2. Perform Custom SLA Computation
     if "Compute" in metric_strat:
