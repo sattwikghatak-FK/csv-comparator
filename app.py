@@ -180,15 +180,20 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
              m["_val_A"].notna() & m["_val_B"].isna(), deg, imp],
             ["New","Removed","Degraded","Improved"], default="Same")
 
+        # Keep ALL columns from both files side-by-side for reference.
+        # Common cols → "{col} (File A)" and "{col} (File B)" (both retained).
+        # Only-A cols → "{col} (File A)".
+        # Only-B cols → "{col} (File B)".
+        rename_map = {}
         for c in [c for c in common_cols if c not in ["__key__", val_col]]:
             ca, cb = f"{c}_A", f"{c}_B"
-            if ca in m.columns and cb in m.columns:
-                src = cb if (not is_strict and granular_file and "File B" in granular_file) else ca
-                alt = ca if src == cb else cb
-                m[c] = m[src].combine_first(m[alt])
-                m.drop(columns=[ca, cb], inplace=True)
-            elif ca in m.columns: m.rename(columns={ca: c}, inplace=True)
-            elif cb in m.columns: m.rename(columns={cb: c}, inplace=True)
+            if ca in m.columns: rename_map[ca] = f"{c} (File A)"
+            if cb in m.columns: rename_map[cb] = f"{c} (File B)"
+        for c in only_a:
+            if c in m.columns: rename_map[c] = f"{c} (File A)"
+        for c in only_b:
+            if c in m.columns: rename_map[c] = f"{c} (File B)"
+        m.rename(columns=rename_map, inplace=True)
 
         if not m.empty: chunks.append(m)
         del sa, sb, m; gc.collect()
@@ -196,12 +201,10 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     ui("Assembling final dataset...", 95)
     final = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
-    # Normalise every string context column to title-case so values that
-    # differ only in capitalisation (e.g. "BANGALORE" vs "Bangalore") are
-    # unified — this is the same case-mismatch root cause as the key fix,
-    # but manifesting in display/grouping columns after the outer merge.
+    # Normalise string columns to title-case so BANGALORE/Bangalore unify.
+    skip_norm = {"__key__", "_val_A", "_val_B", "Status"}
     for c in final.select_dtypes(include=["object", "string"]).columns:
-        if c not in ["__key__", "_val_A", "_val_B", "Status"]:
+        if c not in skip_norm:
             final[c] = final[c].astype(str).str.strip().str.title()
             final[c] = final[c].replace("Nan", np.nan)
 
@@ -212,10 +215,22 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     final.rename(columns={"__key__": kd,
                            "_val_A": f"{val_col} (File A)",
                            "_val_B": f"{val_col} (File B)"}, inplace=True)
+
+    # Build ordered column list:
+    # [key | val A | val B | Δ | Status | Group]
+    # then common cols interleaved as (File A)/(File B) pairs
+    # then only-A cols, then only-B cols
     base = [kd, f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status", "Group"]
-    ctx  = list(dict.fromkeys([c for c in (common_cols + only_a + only_b)
-                                if c not in base and c not in ["__key__", val_col]
-                                and c in final.columns]))
+    paired = []
+    for c in common_cols:
+        if c in ["__key__", val_col]: continue
+        fa, fb = f"{c} (File A)", f"{c} (File B)"
+        if fa in final.columns: paired.append(fa)
+        if fb in final.columns: paired.append(fb)
+    solo_a = [f"{c} (File A)" for c in only_a if f"{c} (File A)" in final.columns]
+    solo_b = [f"{c} (File B)" for c in only_b if f"{c} (File B)" in final.columns]
+    ctx = list(dict.fromkeys(paired + solo_a + solo_b))
+
     if not is_strict: final = final.drop_duplicates()
     ui("Analysis Complete! 🚀", 100)
     return final[[c for c in base + ctx if c in final.columns]]
@@ -237,6 +252,97 @@ def style_table(df: pd.DataFrame):
     return (df.style.apply(row_style, axis=1)
               .format(num_fmt, na_rep="—")
               .set_properties(**{"font-size":"13px","font-weight":"500"}))
+
+# ── Output column selector ────────────────────────────────────────────────────
+def slim_output(df: pd.DataFrame, val_col: str, key_cols: list) -> pd.DataFrame:
+    """
+    Keep only the reference columns the user cares about.
+
+    Columns retained (in order):
+        key | SLA A | SLA B | Δ | Status
+        | Total SLA Hrs A | Total SLA Hrs B
+        | MH Name A | MH Name B
+        | S2H (coalesced) | PH Name (coalesced) | DH Name (coalesced)
+        | Dest City (best available)
+        | Group
+    """
+    kd   = "-".join(key_cols)
+    SKIP = {kd, "Status", "Δ Change", "Group",
+            f"{val_col} (File A)", f"{val_col} (File B)"}
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _find_a(patterns):
+        for pat in patterns:
+            c = next((c for c in df.columns
+                      if pat.lower() in c.lower() and "(file a)" in c.lower()), None)
+            if c: return c
+        return None
+
+    def _find_b(patterns):
+        for pat in patterns:
+            c = next((c for c in df.columns
+                      if pat.lower() in c.lower() and "(file b)" in c.lower()), None)
+            if c: return c
+        return None
+
+    def _find_any(patterns):
+        """File A preferred, then File B, then plain (for only-one-side cols)."""
+        return _find_a(patterns) or _find_b(patterns) or next(
+            (c for c in df.columns
+             if any(p.lower() in c.lower() for p in patterns)
+             and c not in SKIP), None)
+
+    def _coalesce(patterns):
+        """Merge A and B: A where available, otherwise B (handles New/Removed rows)."""
+        ca, cb = _find_a(patterns), _find_b(patterns)
+        if ca and cb:  return df[ca].combine_first(df[cb])
+        if ca:         return df[ca]
+        if cb:         return df[cb]
+        plain = _find_any(patterns)
+        return df[plain] if plain else None
+
+    # ── assemble ──────────────────────────────────────────────────────────────
+    out = {}
+
+    out[kd] = df[kd]
+
+    # SLA days — both files (the primary comparison metric)
+    for lbl in [f"{val_col} (File A)", f"{val_col} (File B)", "Δ Change", "Status"]:
+        if lbl in df.columns: out[lbl] = df[lbl]
+
+    # Total SLA Hours — keep both so you can see what changed upstream
+    ca = _find_a(["total_sla_hrs", "total_sla"])
+    cb = _find_b(["total_sla_hrs", "total_sla"])
+    if ca: out["Total SLA Hrs (File A)"] = df[ca]
+    if cb: out["Total SLA Hrs (File B)"] = df[cb]
+
+    # MH Name — keep both (may differ for New/Removed rows)
+    ca = _find_a(["ekart_mh_name", "mh_name"])
+    cb = _find_b(["ekart_mh_name", "mh_name"])
+    if ca: out["MH Name (File A)"] = df[ca]
+    if cb: out["MH Name (File B)"] = df[cb]
+
+    # S2H — coalesce (usually identical, but NaN on one side for New/Removed)
+    s = _coalesce(["s2h_in_hr", "s2h"])
+    if s is not None: out["S2H (hrs)"] = s
+
+    # PH Name — coalesce
+    s = _coalesce(["ph_name"])
+    if s is not None: out["PH Name"] = s
+
+    # DH Name — coalesce
+    s = _coalesce(["dh_name"])
+    if s is not None: out["DH Name"] = s
+
+    # Dest City — priority order: mapped_dest_city → city_from_mapped_dmh → city_from_dmh
+    dest = _find_any(["mapped_dest_city", "city_from_mapped_dmh",
+                      "city_from_dmh", "dest_city", "dest city"])
+    if dest: out["Dest City"] = df[dest]
+
+    if "Group" in df.columns: out["Group"] = df["Group"]
+
+    return pd.DataFrame(out)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
@@ -425,9 +531,13 @@ if run:
                                 errors='coerce').fillna(0)
             df[val_col] = np.ceil((sla - f2f) / 24)
 
-    results = process_comparison_chunked(
+    results_full = process_comparison_chunked(
         df_a_full, df_b_full, comp_mode, granular_file, col_map,
         key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
+
+    # Slim to only the reference columns the user needs
+    results = slim_output(results_full, val_col, key_cols)
+    del results_full; gc.collect()
 
     st.session_state.update({"results": results, "key_cols": key_cols,
                               "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
