@@ -236,7 +236,15 @@ st.caption("Compare massive CSV/Excel datasets seamlessly · Optimized Chunk Pro
 
 with st.container(border=True):
     st.markdown("#### 1. Upload Datasets")
-    st.info("**Expected Contextual Columns:** `ph_name`, `dh_name`, `f2p_sla`, `pincode`, `s2h_in_hr`, `lpht`, `f2f_del_sla`, `f2f_buffer_sla`, `total_sla_hrs`", icon="📋")
+    
+    # EXPLICIT MANDATORY VS OPTIONAL COLUMNS UI
+    st.warning("""
+    **🚨 Mandatory Columns:**
+    - **For Identifiers/Keys:** At least one shared tracking column (e.g., `pincode`, `dh_name`).
+    - **For 'Compute Derived SLA':** `total_sla_hrs` **AND** a buffer column (e.g., `f2f_del_sla` or `f2f_buffer_sla`).
+
+    **💡 Optional/Contextual Columns (passed through if present):** `ph_name`, `f2p_sla`, `s2h_in_hr`, `lpht`
+    """, icon="⚠️")
     
     c1, c2 = st.columns(2)
     with c1:
@@ -255,7 +263,7 @@ with st.container(border=True):
                    if up_b and up_b.name.lower().endswith(".xlsx") else None)
 
 if not (up_a and up_b):
-    st.warning("⬆ Upload both files to configure your comparison.", icon="ℹ️")
+    st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
 # Instant after first upload — cache key is (name, size, sheet), not bytes
@@ -355,12 +363,10 @@ if run:
 
     status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**"); progress_bar.progress(10)
     df_a_full = load_full_data(up_a, sheet_a)
-    # Aggressively drop unused columns immediately
     df_a_full = df_a_full[[c for c in essential_cols_a if c in df_a_full.columns]]
 
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**"); progress_bar.progress(35)
     df_b_full = load_full_data(up_b, sheet_b)
-    # Aggressively drop unused columns immediately
     df_b_full = df_b_full[[c for c in essential_cols_b if c in df_b_full.columns]]
     
     # 2. Perform Custom SLA Computation
