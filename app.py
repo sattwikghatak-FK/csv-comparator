@@ -5,7 +5,7 @@ from io import BytesIO
 import gc
 
 # ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="SLA Comparator", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Air SLA Comparator", page_icon="✈️", layout="wide")
 
 st.markdown("""
 <style>
@@ -32,24 +32,7 @@ def reset_computation():
         st.session_state.pop(key, None)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FILE BYTES CACHE — the core fix
-#
-# Problem: @st.cache_data hashes ALL arguments on every call to check for a
-# cache hit.  Hashing a 50 MB bytes object takes ~100–200 ms.  With files
-# uploaded, EVERY widget interaction (multiselect, selectbox, radio) triggers
-# a full script rerun, and each rerun re-hashes the bytes → that IS the lag.
-#
-# Solution — two-layer approach:
-#   Layer 1: session_state stores raw bytes keyed by (name, size).
-#            get_file_bytes() reads from disk ONLY when the file actually
-#            changes; all other reruns return the cached bytes in ~0 ms.
-#
-#   Layer 2: @st.cache_data functions receive bytes via a _-prefixed param.
-#            Streamlit SKIPS hashing for parameters whose name starts with _.
-#            The actual cache key is just (file_name, file_size, sheet_name)
-#            — a tiny tuple that hashes in microseconds.
-#
-# Net result: cache lookup is instant on every rerun; file I/O only on upload.
+# FILE BYTES CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 def get_file_bytes(uploaded_file, ss_key: str) -> bytes:
     file_id = (uploaded_file.name, uploaded_file.size)
@@ -59,11 +42,9 @@ def get_file_bytes(uploaded_file, ss_key: str) -> bytes:
         st.session_state[f"_fid_{ss_key}"]    = file_id
     return st.session_state[f"_fbytes_{ss_key}"]
 
-
 @st.cache_data(show_spinner=False)
 def _cached_sheet_names(file_name: str, file_size: int, _file_bytes: bytes) -> list:
     return pd.ExcelFile(BytesIO(_file_bytes)).sheet_names
-
 
 @st.cache_data(show_spinner=False)
 def _cached_preview(file_name: str, file_size: int, sheet_name,
@@ -76,7 +57,6 @@ def _cached_preview(file_name: str, file_size: int, sheet_name,
                            skipinitialspace=True, encoding_errors="replace", nrows=2000))
     return _clean_df(df)
 
-
 @st.cache_data(show_spinner=False)
 def _cached_sniff(file_name: str, file_size: int, sheet_name,
                   _file_bytes: bytes) -> dict:
@@ -87,7 +67,6 @@ def _cached_sniff(file_name: str, file_size: int, sheet_name,
         out[col] = (not vals.empty and
                     pd.to_numeric(vals, errors="coerce").notna().mean() > 0.6)
     return out
-
 
 # ── Public wrappers (pass bytes as unhashed _param) ───────────────────────────
 def get_sheet_names(f) -> list:
@@ -107,7 +86,6 @@ def load_full_data(f, sheet=None) -> pd.DataFrame:
           else pd.read_csv(buf, dtype=str, keep_default_na=False,
                            skipinitialspace=True, encoding_errors="replace"))
     return _clean_df(df)
-
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -253,11 +231,13 @@ def style_table(df: pd.DataFrame):
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
-st.title("📊 SLA Comparator")
-st.caption("Compare massive CSV/Excel datasets seamlessly · Chunk Processing Engine Enabled")
+st.title("✈️ Air SLA Comparator")
+st.caption("Compare massive CSV/Excel datasets seamlessly · Optimized Chunk Processing Engine")
 
 with st.container(border=True):
     st.markdown("#### 1. Upload Datasets")
+    st.info("**Expected Contextual Columns:** `ph_name`, `dh_name`, `f2p_sla`, `pincode`, `s2h_in_hr`, `lpht`, `f2f_del_sla`, `f2f_buffer_sla`, `total_sla_hrs`", icon="📋")
+    
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**📁 File A — Baseline / Previous**")
@@ -275,7 +255,7 @@ with st.container(border=True):
                    if up_b and up_b.name.lower().endswith(".xlsx") else None)
 
 if not (up_a and up_b):
-    st.info("⬆ Upload both files to configure your comparison.", icon="ℹ️")
+    st.warning("⬆ Upload both files to configure your comparison.", icon="ℹ️")
     st.stop()
 
 # Instant after first upload — cache key is (name, size, sheet), not bytes
@@ -296,6 +276,26 @@ numeric_cols = [c for c in common if sniff_a.get(c) or sniff_b.get(col_map.get(c
 
 with st.container(border=True):
     st.markdown("#### 2. Configure Comparison")
+    
+    # NEW: Metric Strategy
+    metric_strat = st.radio(
+        "⚙️ Evaluation Strategy",
+        ["Compare an existing column", "Compute Derived SLA (Days): Round((Total SLA Hrs - F2F Hrs) / 24, 0)"],
+        index=0, on_change=reset_computation
+    )
+    
+    if "Compute" in metric_strat:
+        mc1, mc2, mc3 = st.columns(3)
+        sla_hrs_col = mc1.selectbox("⏱️ Select Total SLA Hours Col", options=numeric_cols or common, on_change=reset_computation)
+        f2f_hrs_col = mc2.selectbox("🛑 Select F2F / Buffer Col", options=numeric_cols or common, index=min(1, len(numeric_cols)-1) if len(numeric_cols) > 1 else 0, on_change=reset_computation)
+        val_col = mc3.text_input("✏️ Computed Column Name", value="Computed_SLA_Days", on_change=reset_computation)
+    else:
+        val_opts = ([c for c in numeric_cols if c not in key_cols]
+                    or [c for c in common if c not in key_cols])
+        val_col  = st.selectbox("📐 Metric to Compare", options=val_opts, on_change=reset_computation)
+
+    st.markdown("---")
+    
     mode_c1, mode_c2 = st.columns(2)
     comp_mode = mode_c1.radio("⚙️ Match Architecture",
                                ["Strict 1-to-1 (Deduplicate Both)",
@@ -309,17 +309,12 @@ with st.container(border=True):
             on_change=reset_computation)
     st.markdown("---")
 
-    cfg1, cfg2, cfg3 = st.columns([2, 1, 1])
+    cfg1, cfg2 = st.columns(2)
     with cfg1:
         key_cols = st.multiselect("🔑 Unique Identifier(s)", options=common,
                                    default=[common[0]] if common else [],
                                    on_change=reset_computation)
     with cfg2:
-        val_opts = ([c for c in numeric_cols if c not in key_cols]
-                    or [c for c in common if c not in key_cols])
-        val_col  = st.selectbox("📐 Metric to Compare", options=val_opts,
-                                 on_change=reset_computation)
-    with cfg3:
         grp_sel = st.selectbox("🗂 Group By (Optional)",
                                 ["(none)"] + [c for c in common if c != val_col],
                                 on_change=reset_computation)
@@ -329,12 +324,15 @@ with st.container(border=True):
         "📈 Value direction meaning",
         ["higher_is_worse", "higher_is_better"],
         index=0 if infer_direction(val_col) == "higher_is_worse" else 1,
-        format_func=lambda x: "⬆ Higher = Worse (e.g., Latency)"
-                               if x == "higher_is_worse" else "⬆ Higher = Better (e.g., Score)",
+        format_func=lambda x: "⬆ Higher = Worse (e.g., Latency, Days)"
+                               if x == "higher_is_worse" else "⬆ Higher = Better (e.g., Score, Resolution %)",
         horizontal=True, on_change=reset_computation)
 
-    run = st.button("🚀 Run Full Analysis", type="primary",
-                    disabled=not (key_cols and val_col))
+    run_disabled = not key_cols or not val_col
+    if "Compute" in metric_strat:
+        run_disabled = run_disabled or not sla_hrs_col or not f2f_hrs_col
+
+    run = st.button("🚀 Run Full Analysis", type="primary", disabled=run_disabled)
 
 if not run and "results" not in st.session_state:
     st.stop()
@@ -349,6 +347,18 @@ if run:
 
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**"); progress_bar.progress(35)
     df_b_full = load_full_data(up_b, sheet_b)
+    
+    # Perform Custom SLA Computation before processing logic
+    if "Compute" in metric_strat:
+        status_text.markdown(f"**⏳ Computing {val_col}...**"); progress_bar.progress(45)
+        for df, is_a in [(df_a_full, True), (df_b_full, False)]:
+            # Resolve mapped column for File B if needed
+            mapped_sla = sla_hrs_col if is_a else col_map.get(sla_hrs_col, sla_hrs_col)
+            mapped_f2f = f2f_hrs_col if is_a else col_map.get(f2f_hrs_col, f2f_hrs_col)
+            
+            sla = pd.to_numeric(df[mapped_sla], errors='coerce').fillna(0)
+            f2f = pd.to_numeric(df[mapped_f2f], errors='coerce').fillna(0)
+            df[val_col] = ((sla - f2f) / 24).round(0)
 
     results = process_comparison_chunked(
         df_a_full, df_b_full, comp_mode, granular_file, col_map,
@@ -356,6 +366,10 @@ if run:
 
     st.session_state.update({"results": results, "key_cols": key_cols,
                               "val_col": val_col, "grp_col": grp_col, "higher_is": higher_is})
+    
+    del df_a_full, df_b_full
+    gc.collect()
+    
     status_text.empty(); progress_bar.empty()
 
 results   = st.session_state["results"]
@@ -411,7 +425,7 @@ def results_viewer():
         st.markdown("#### Download CSV Report")
         csv_bytes = view.drop(columns=["Group"], errors="ignore").to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download CSV", data=csv_bytes,
-                           file_name=f"SLA_Report_{val_col}.csv",
+                           file_name=f"Air_SLA_Report_{val_col}.csv",
                            mime="text/csv", type="primary")
 
 results_viewer()
