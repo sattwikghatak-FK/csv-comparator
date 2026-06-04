@@ -118,7 +118,7 @@ def infer_direction(val_col: str) -> str:
 
 def make_key(df, cols):
     res = df[cols[0]].astype(str)
-    for c in cols[1:]: res = res + " › " + df[c].astype(str)
+    for c in cols[1:]: res = res + "-" + df[c].astype(str)
     return res
 
 # ── Chunk processing engine ───────────────────────────────────────────────────
@@ -198,7 +198,7 @@ def process_comparison_chunked(df_a, df_b, comp_mode, granular_file, col_map,
     final["Group"] = (final[grp_col].fillna("Unknown")
                       if grp_col and grp_col in final.columns else "All")
 
-    kd = " › ".join(key_cols)
+    kd = "-".join(key_cols)
     final.rename(columns={"__key__": kd,
                            "_val_A": f"{val_col} (File A)",
                            "_val_B": f"{val_col} (File B)"}, inplace=True)
@@ -277,7 +277,7 @@ numeric_cols = [c for c in common if sniff_a.get(c) or sniff_b.get(col_map.get(c
 with st.container(border=True):
     st.markdown("#### 2. Configure Comparison")
     
-    # NEW: Metric Strategy
+    # Metric Strategy
     metric_strat = st.radio(
         "⚙️ Evaluation Strategy",
         ["Compare an existing column", "Compute Derived SLA (Days): Round((Total SLA Hrs - F2F Hrs) / 24, 0)"],
@@ -342,24 +342,39 @@ if run:
     status_text  = st.empty()
     progress_bar = st.progress(0)
 
+    # 1. Determine strictly necessary columns to save massive amounts of RAM
+    essential_cols_a = set(key_cols)
+    if grp_col: essential_cols_a.add(grp_col)
+    
+    if "Compute" in metric_strat:
+        essential_cols_a.update([sla_hrs_col, f2f_hrs_col])
+    else:
+        essential_cols_a.add(val_col)
+        
+    essential_cols_b = {col_map.get(c, c) for c in essential_cols_a}
+
     status_text.markdown(f"**⏳ Reading {up_a.name} into memory...**"); progress_bar.progress(10)
     df_a_full = load_full_data(up_a, sheet_a)
+    # Aggressively drop unused columns immediately
+    df_a_full = df_a_full[[c for c in essential_cols_a if c in df_a_full.columns]]
 
     status_text.markdown(f"**⏳ Reading {up_b.name} into memory...**"); progress_bar.progress(35)
     df_b_full = load_full_data(up_b, sheet_b)
+    # Aggressively drop unused columns immediately
+    df_b_full = df_b_full[[c for c in essential_cols_b if c in df_b_full.columns]]
     
-    # Perform Custom SLA Computation before processing logic
+    # 2. Perform Custom SLA Computation
     if "Compute" in metric_strat:
         status_text.markdown(f"**⏳ Computing {val_col}...**"); progress_bar.progress(45)
         for df, is_a in [(df_a_full, True), (df_b_full, False)]:
-            # Resolve mapped column for File B if needed
             mapped_sla = sla_hrs_col if is_a else col_map.get(sla_hrs_col, sla_hrs_col)
             mapped_f2f = f2f_hrs_col if is_a else col_map.get(f2f_hrs_col, f2f_hrs_col)
             
-            sla = pd.to_numeric(df[mapped_sla], errors='coerce').fillna(0)
-            f2f = pd.to_numeric(df[mapped_f2f], errors='coerce').fillna(0)
+            sla = pd.to_numeric(df.get(mapped_sla, pd.Series(0, index=df.index)), errors='coerce').fillna(0)
+            f2f = pd.to_numeric(df.get(mapped_f2f, pd.Series(0, index=df.index)), errors='coerce').fillna(0)
             df[val_col] = ((sla - f2f) / 24).round(0)
 
+    # 3. Process Chunked Engine
     results = process_comparison_chunked(
         df_a_full, df_b_full, comp_mode, granular_file, col_map,
         key_cols, val_col, grp_col, higher_is, status_text, progress_bar)
@@ -394,7 +409,7 @@ def results_viewer():
         status_filter = fc1.multiselect("Filter by Status", STATUS_ORDER,
                                          default=[], placeholder="All statuses")
         search  = fc2.text_input("🔍 Search in Key", placeholder="Type to filter...")
-        kd      = " › ".join(key_cols)
+        kd      = "-".join(key_cols)
         sort_by = fc3.selectbox("Sort By",
                                  ["Δ Change", f"{val_col} (File A)",
                                   f"{val_col} (File B)", "Status", kd])
